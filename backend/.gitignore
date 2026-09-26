@@ -1,0 +1,25 @@
+# EarthWatch AI — Backend .gitignore
+# Credentials and environment files
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Local data / registries
+data/*.db
+data/*.sqlite
+
+# Logs
+*.log

@@ -1,0 +1,38 @@
+# EarthWatch AI Root .gitignore
+# Environment & secrets — NEVER commit
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# Dependencies & Build artifacts
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+
+# Python & Virtual Environments
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+venv/
+**/venv/
+.venv/
+**/ .venv/
+
+# Local databases & registries
+*.db
+*.sqlite
+data/*.db
+data/*.sqlite
+
+# Logs & temporary files
+*.log
+scratch/
+**/scratch/
+.DS_Store
+.idea/
+.vscode/
