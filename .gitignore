@@ -23,11 +23,13 @@ venv/
 .venv/
 **/ .venv/
 
-# Local databases & registries
+# Local databases & registries & satellite downloads
 *.db
 *.sqlite
 data/*.db
 data/*.sqlite
+backend/data/sentinel1/
+**/data/sentinel1/
 
 # Logs & temporary files
 *.log

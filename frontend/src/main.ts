@@ -215,6 +215,28 @@ interface CdseAuthResponse {
   message: string;
 }
 
+// Sentinel-1 Controlled Download types
+interface Sentinel1DownloadResponse {
+  status: "downloaded" | "already_downloaded" | "authentication_failed" | "download_failed" | "invalid_product" | "not_found";
+  product_id?: string;
+  location_id?: number;
+  file_path?: string;
+  file_size_bytes?: number;
+  download_status?: "COMPLETED" | "ALREADY_EXISTS";
+  message?: string;
+}
+
+interface Sentinel1DownloadInfoResponse {
+  status: string;
+  product_id: string;
+  filename?: string;
+  expected_size_bytes?: number | null;
+  is_downloaded: boolean;
+  existing_path?: string | null;
+  existing_size_bytes?: number | null;
+  message?: string;
+}
+
 // Central Selected-Location State
 export let dbLocations: LocationRecord[] = [];
 export let selectedLocationId: number = 1;
@@ -873,13 +895,13 @@ appRoot.innerHTML = `
             🛰️ Sentinel-1 SAR Product Discovery
             <span class="provenance-tag tag-stac">COPERNICUS DATA SPACE</span>
           </h3>
-          <span class="provenance-tag tag-proto">PRODUCT DISCOVERY ONLY — DOWNLOAD NOT ENABLED</span>
+          <span class="provenance-tag tag-proto">CONTROLLED PRODUCT ACQUISITION</span>
         </div>
 
         <div class="s1-discovery-info-bar">
           <div class="s1-discovery-badges">
             <span class="provenance-tag tag-stac">COPERNICUS DATA SPACE</span>
-            <span class="provenance-tag tag-proto">PRODUCT DISCOVERY ONLY — DOWNLOAD NOT ENABLED</span>
+            <span class="provenance-tag tag-proto">CONTROLLED SINGLE-PRODUCT ACQUISITION</span>
           </div>
           <div class="s1-discovery-meta">
             <span>📍 Location: <strong id="s1-location-name">--</strong></span>
@@ -892,11 +914,9 @@ appRoot.innerHTML = `
         </div>
 
         <div class="s1-discovery-notice">
-          ⚠️ <strong>Data Honesty Notice:</strong> This panel shows <strong>Copernicus STAC product metadata only</strong>.
-          Products listed here have NOT been downloaded or processed locally.
-          Discovering a product does not imply flood detection.
-          This is distinct from <span class="provenance-tag tag-db">DATABASE OBSERVATIONS</span> and
-          <span class="provenance-tag tag-proto">PROTOTYPE FLOOD DETECTION</span>.
+          ⚠️ <strong>Data Honesty Notice:</strong> This panel enables <strong>controlled single-product Sentinel-1 downloads</strong>.
+          Products are not automatically downloaded. Select a specific product to download and store locally.
+          Downloading a product does not yet perform SAR preprocessing or flood detection.
         </div>
 
         <div id="s1-discovery-status" class="s1-discovery-status-bar" style="display:none;"></div>
@@ -1003,6 +1023,37 @@ appRoot.innerHTML = `
             </div>
 
           </div>
+        </div>
+    <!-- SENTINEL-1 DOWNLOAD CONFIRMATION MODAL -->
+    <div id="s1-download-modal" class="modal-backdrop" style="display:none;">
+      <div class="modal-window s1-download-modal-window">
+        <div class="modal-header">
+          <h3>🛰️ Sentinel-1 Product Download</h3>
+          <button id="close-s1-download-btn" class="modal-btn-close">&times;</button>
+        </div>
+        <div class="modal-body s1-download-modal-body">
+          <p style="margin-bottom:12px; font-size:14px; font-weight:600; color:var(--text-main);">
+            Sentinel-1 product download
+          </p>
+          <div class="s1-confirm-detail-row">
+            <span class="s1-confirm-label">Product:</span>
+            <code id="s1-confirm-product-id" class="s1-confirm-code">--</code>
+          </div>
+          <div id="s1-confirm-size-row" class="s1-confirm-detail-row" style="display:none;">
+            <span class="s1-confirm-label">Estimated Size:</span>
+            <span id="s1-confirm-size-val" class="s1-confirm-size">--</span>
+          </div>
+          <div class="s1-confirm-warning-box">
+            <p><strong>This product may be large and will be stored locally.</strong></p>
+            <p style="margin-top:6px; font-size:12px; color:var(--text-dim);">Storage destination: <code>backend/data/sentinel1/&lt;product_id&gt;/</code></p>
+          </div>
+          <p style="margin-top:16px; font-weight:600; font-size:14px; color:var(--text-main);">
+            Continue?
+          </p>
+        </div>
+        <div class="modal-actions s1-download-modal-actions">
+          <button id="s1-download-cancel-btn" class="modal-btn-secondary">Cancel</button>
+          <button id="s1-download-proceed-btn" class="action-btn" style="padding:8px 20px; font-size:13px; background:var(--accent-blue);">Download</button>
         </div>
       </div>
     </div>
@@ -1259,6 +1310,53 @@ async function testCdseAuth(): Promise<CdseAuthResponse> {
   const response = await axios.post<CdseAuthResponse>(`${BACKEND_URL}/cdse/test`, null, {
     timeout: 25000,
   });
+  return response.data;
+}
+
+function formatBytes(bytes?: number | null): string {
+  if (!bytes || bytes <= 0) return "--";
+  if (bytes >= 1024 * 1024 * 1024) {
+    return `~${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB (${bytes.toLocaleString()} bytes)`;
+  }
+  if (bytes >= 1024 * 1024) {
+    return `~${(bytes / (1024 * 1024)).toFixed(1)} MB (${bytes.toLocaleString()} bytes)`;
+  }
+  return `${(bytes / 1024).toFixed(1)} KB`;
+}
+
+async function fetchSentinel1DownloadInfo(
+  productId: string,
+  locationId: number
+): Promise<Sentinel1DownloadInfoResponse | null> {
+  try {
+    const response = await axios.get<Sentinel1DownloadInfoResponse>(
+      `${BACKEND_URL}/sentinel1/download/info`,
+      {
+        params: { product_id: productId, location_id: locationId },
+        timeout: 8000,
+      }
+    );
+    return response.data;
+  } catch {
+    return null;
+  }
+}
+
+async function requestSentinel1Download(
+  productId: string,
+  locationId: number
+): Promise<Sentinel1DownloadResponse> {
+  const response = await axios.post<Sentinel1DownloadResponse>(
+    `${BACKEND_URL}/sentinel1/download`,
+    {
+      product_id: productId,
+      location_id: locationId,
+    },
+    {
+      timeout: 300000, // 5 minutes for streaming download
+      validateStatus: (status) => status < 500, // Handle 200, 400, 404 cleanly
+    }
+  );
   return response.data;
 }
 
@@ -1969,21 +2067,194 @@ function renderSentinel1Products(data: Sentinel1ProductResponse) {
             </div>
             <div class="s1-field">
               <span class="s1-field-label">Download Status</span>
-              <span class="s1-field-value s1-not-downloaded">NOT DOWNLOADED</span>
+              <span class="s1-field-value s1-not-downloaded" id="s1-dl-badge-${i}">NOT DOWNLOADED</span>
             </div>
           </div>
-          ${p.stac_item_url ? `
           <div class="s1-product-footer">
+            <div class="s1-product-footer-actions">
+              <button 
+                class="s1-download-btn" 
+                id="s1-download-btn-${i}" 
+                data-product-id="${p.product_id || ''}"
+                data-location-id="${data.location?.location_id || selectedLocationId}"
+                data-index="${i}"
+              >
+                📥 Download
+              </button>
+              <span class="s1-download-msg" id="s1-download-msg-${i}"></span>
+            </div>
+            ${p.stac_item_url ? `
             <a href="${p.stac_item_url}" target="_blank" rel="noopener noreferrer"
                class="s1-stac-link">
               🔗 View STAC Metadata
-            </a>
-            <span class="s1-no-download-note">⛔ File not downloaded — discovery only</span>
-          </div>` : ""}
+            </a>` : ""}
+          </div>
         </div>
       `;
     })
     .join("");
+
+  // Attach download button listeners to discovered cards
+  const downloadBtns = container.querySelectorAll<HTMLButtonElement>(".s1-download-btn");
+  downloadBtns.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const prodId = btn.getAttribute("data-product-id");
+      const locIdStr = btn.getAttribute("data-location-id");
+      const idxStr = btn.getAttribute("data-index");
+      if (!prodId) return;
+      const locId = locIdStr ? parseInt(locIdStr, 10) : selectedLocationId;
+      const idx = idxStr ? parseInt(idxStr, 10) : 0;
+      handleInitiateSentinel1Download(prodId, locId, idx);
+    });
+  });
+}
+
+// ──────────────────────────────────────────────────────────────
+// SENTINEL-1 CONTROLLED SINGLE-PRODUCT DOWNLOAD HANDLERS
+// ──────────────────────────────────────────────────────────────
+
+let pendingDownloadProductId: string | null = null;
+let pendingDownloadLocationId: number | null = null;
+let pendingDownloadCardIndex: number | null = null;
+let isDownloadingSentinel1: boolean = false;
+
+function closeSentinel1DownloadModal() {
+  const modalEl = document.querySelector<HTMLElement>("#s1-download-modal");
+  if (modalEl) modalEl.style.display = "none";
+  pendingDownloadProductId = null;
+  pendingDownloadLocationId = null;
+  pendingDownloadCardIndex = null;
+}
+
+async function handleInitiateSentinel1Download(
+  productId: string,
+  locationId: number,
+  cardIndex: number
+) {
+  if (isDownloadingSentinel1) {
+    alert("A Sentinel-1 download is currently in progress. Please wait for it to complete.");
+    return;
+  }
+
+  pendingDownloadProductId = productId;
+  pendingDownloadLocationId = locationId;
+  pendingDownloadCardIndex = cardIndex;
+
+  const modalEl = document.querySelector<HTMLElement>("#s1-download-modal");
+  const confirmProdIdEl = document.querySelector<HTMLElement>("#s1-confirm-product-id");
+  const confirmSizeRowEl = document.querySelector<HTMLElement>("#s1-confirm-size-row");
+  const confirmSizeValEl = document.querySelector<HTMLElement>("#s1-confirm-size-val");
+
+  if (confirmProdIdEl) confirmProdIdEl.textContent = productId;
+  if (confirmSizeRowEl) confirmSizeRowEl.style.display = "none";
+
+  // Display confirmation modal before starting download
+  if (modalEl) modalEl.style.display = "flex";
+
+  // Pre-fetch product size asynchronously if available
+  try {
+    const info = await fetchSentinel1DownloadInfo(productId, locationId);
+    if (info && info.expected_size_bytes && confirmSizeRowEl && confirmSizeValEl) {
+      confirmSizeValEl.textContent = formatBytes(info.expected_size_bytes);
+      confirmSizeRowEl.style.display = "flex";
+    }
+  } catch {
+    // If size cannot be determined beforehand, modal still displays size warning
+  }
+}
+
+async function handleProceedSentinel1Download() {
+  const modalEl = document.querySelector<HTMLElement>("#s1-download-modal");
+  if (modalEl) modalEl.style.display = "none";
+
+  const productId = pendingDownloadProductId;
+  const locationId = pendingDownloadLocationId;
+  const cardIndex = pendingDownloadCardIndex;
+
+  if (!productId || locationId === null || cardIndex === null) return;
+
+  const btn = document.querySelector<HTMLButtonElement>(`#s1-download-btn-${cardIndex}`);
+  const msgEl = document.querySelector<HTMLElement>(`#s1-download-msg-${cardIndex}`);
+  const badgeEl = document.querySelector<HTMLElement>(`#s1-dl-badge-${cardIndex}`);
+
+  // Transition to downloading state
+  isDownloadingSentinel1 = true;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Downloading...";
+  }
+  if (msgEl) {
+    msgEl.className = "s1-download-msg s1-dl-status s1-dl-loading";
+    msgEl.textContent = "Downloading Sentinel-1 product...";
+  }
+
+  try {
+    const result = await requestSentinel1Download(productId, locationId);
+
+    if (result.status === "downloaded") {
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = "✓ Downloaded";
+      }
+      if (msgEl) {
+        msgEl.className = "s1-download-msg s1-dl-status s1-dl-success";
+        msgEl.textContent = "✓ Sentinel-1 product downloaded successfully.";
+      }
+      if (badgeEl) {
+        badgeEl.className = "s1-field-value s1-downloaded";
+        badgeEl.textContent = "COMPLETED";
+      }
+    } else if (result.status === "already_downloaded") {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "✓ Downloaded";
+      }
+      if (msgEl) {
+        msgEl.className = "s1-download-msg s1-dl-status s1-dl-info";
+        msgEl.textContent = "✓ Product already downloaded.";
+      }
+      if (badgeEl) {
+        badgeEl.className = "s1-field-value s1-downloaded";
+        badgeEl.textContent = "ALREADY EXISTS";
+      }
+    } else if (result.status === "authentication_failed") {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "Download";
+      }
+      if (msgEl) {
+        msgEl.className = "s1-download-msg s1-dl-status s1-dl-error";
+        msgEl.textContent = "✕ Copernicus authentication failed.";
+      }
+    } else {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "Download";
+      }
+      if (msgEl) {
+        msgEl.className = "s1-download-msg s1-dl-status s1-dl-error";
+        msgEl.textContent = "✕ Unable to download Sentinel-1 product.";
+      }
+    }
+  } catch (err: any) {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Download";
+    }
+    if (msgEl) {
+      msgEl.className = "s1-download-msg s1-dl-status s1-dl-error";
+      if (err?.response?.data?.status === "authentication_failed") {
+        msgEl.textContent = "✕ Copernicus authentication failed.";
+      } else {
+        msgEl.textContent = "✕ Unable to download Sentinel-1 product.";
+      }
+    }
+  } finally {
+    isDownloadingSentinel1 = false;
+    pendingDownloadProductId = null;
+    pendingDownloadLocationId = null;
+    pendingDownloadCardIndex = null;
+  }
 }
 
 async function loadSentinel1Discovery(
@@ -2797,6 +3068,22 @@ cdseModal?.addEventListener("click", (e) => {
   }
 });
 
+// Sentinel-1 Download Modal Listeners
+const closeS1DlBtn = document.querySelector<HTMLButtonElement>("#close-s1-download-btn");
+const cancelS1DlBtn = document.querySelector<HTMLButtonElement>("#s1-download-cancel-btn");
+const proceedS1DlBtn = document.querySelector<HTMLButtonElement>("#s1-download-proceed-btn");
+const s1DlModal = document.querySelector<HTMLElement>("#s1-download-modal");
+
+closeS1DlBtn?.addEventListener("click", closeSentinel1DownloadModal);
+cancelS1DlBtn?.addEventListener("click", closeSentinel1DownloadModal);
+proceedS1DlBtn?.addEventListener("click", handleProceedSentinel1Download);
+
+s1DlModal?.addEventListener("click", (e) => {
+  if (e.target === s1DlModal) {
+    closeSentinel1DownloadModal();
+  }
+});
+
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     if (cdseModal && cdseModal.style.display !== "none") {
@@ -2804,6 +3091,9 @@ window.addEventListener("keydown", (e) => {
     }
     if (reportModal && reportModal.style.display !== "none") {
       reportModal.style.display = "none";
+    }
+    if (s1DlModal && s1DlModal.style.display !== "none") {
+      closeSentinel1DownloadModal();
     }
   }
 });

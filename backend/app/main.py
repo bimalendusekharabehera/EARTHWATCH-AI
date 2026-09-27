@@ -18,6 +18,7 @@ from app.api.alerts_db import router as alerts_db_router
 from app.api.reports import router as reports_router
 from app.api.sar_pipeline import router as sar_pipeline_router
 from app.api.sentinel1 import router as sentinel1_router
+from app.api.sentinel1_download import router as sentinel1_download_router
 from app.api.cdse_auth import router as cdse_auth_router
 
 
@@ -62,6 +63,7 @@ app.include_router(alerts_db_router, prefix="/api")
 app.include_router(reports_router, prefix="/api")
 app.include_router(sar_pipeline_router, prefix="/api")
 app.include_router(sentinel1_router, prefix="/api")
+app.include_router(sentinel1_download_router, prefix="/api")
 app.include_router(cdse_auth_router, prefix="/api")
 
 

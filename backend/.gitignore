@@ -17,9 +17,10 @@ env/
 dist/
 build/
 
-# Local data / registries
+# Local data / registries / satellite downloads
 data/*.db
 data/*.sqlite
+data/sentinel1/
 
 # Logs
 *.log
