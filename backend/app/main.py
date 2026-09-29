@@ -20,6 +20,10 @@ from app.api.sar_pipeline import router as sar_pipeline_router
 from app.api.sentinel1 import router as sentinel1_router
 from app.api.sentinel1_download import router as sentinel1_download_router
 from app.api.cdse_auth import router as cdse_auth_router
+from app.api.sar_preprocessing import router as sar_preprocessing_router
+from app.api.flood_detection import router as flood_detection_router
+from app.api.auth import router as auth_router
+from app.api.users import router as users_router
 
 
 
@@ -65,6 +69,10 @@ app.include_router(sar_pipeline_router, prefix="/api")
 app.include_router(sentinel1_router, prefix="/api")
 app.include_router(sentinel1_download_router, prefix="/api")
 app.include_router(cdse_auth_router, prefix="/api")
+app.include_router(sar_preprocessing_router, prefix="/api")
+app.include_router(flood_detection_router, prefix="/api")
+app.include_router(auth_router, prefix="/api")
+app.include_router(users_router, prefix="/api")
 
 
 

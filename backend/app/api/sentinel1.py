@@ -24,10 +24,11 @@ days : int
     Optional. Number of past days to search (default 7, max 30).
 """
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 
 from app.config.database import get_connection
 from app.services.sentinel1_service import discover_sentinel1_products
+from app.api.deps import get_current_user
 
 
 router = APIRouter()
@@ -117,6 +118,7 @@ def get_sentinel1_products(
             "(default 7, max 30)."
         ),
     ),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Discover available Sentinel-1 SAR GRD products from Copernicus Data Space

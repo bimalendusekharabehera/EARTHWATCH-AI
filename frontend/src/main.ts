@@ -4,6 +4,15 @@ import "leaflet/dist/leaflet.css";
 import "./style.css";
 
 import { demoFloodArea } from "./data/demoFlood";
+import {
+  getAuthState,
+  checkStoredSession,
+  loginUser,
+  logoutUser,
+  setupAxiosInterceptors,
+  type AuthUser,
+} from "./auth";
+import { initSpatialLogin, type SpatialLoginController } from "./spatialLogin";
 
 // ======================================================
 // CONFIGURATION & TYPES
@@ -126,21 +135,105 @@ interface ReportLocation {
   longitude: number;
 }
 
+interface ReportExecutiveSummary {
+  location: string;
+  sentinel1_product: string;
+  candidate_area_km2: string;
+  candidate_percentage: string;
+  risk_level: string;
+  risk_score: string;
+  active_alerts_count: number;
+  assessment_category: string;
+}
+
+interface ReportSentinel1Info {
+  product_id: string;
+  platform: string;
+  mode: string;
+  product_type: string;
+  polarizations: string[];
+  acquisition_date: string;
+  download_status: string;
+}
+
+interface ReportPreprocessingInfo {
+  status: string;
+  product_id: string;
+  polarization: string;
+  polarizations_available?: string[];
+  dimensions: string;
+  crs: string;
+  min_value?: number;
+  max_value?: number;
+  mean_value?: number;
+  nodata?: number;
+  valid_pixels?: number;
+  output_file?: string;
+  operations_applied?: string[];
+  all_polarizations?: Record<string, any>;
+}
+
+interface ReportFloodDetectionInfo {
+  status: string;
+  processing_status: string;
+  product_id: string;
+  method: string;
+  classification: string;
+  polarization: string;
+  polarizations_available?: string[];
+  threshold: number;
+  threshold_used?: number;
+  candidate_pixels?: number;
+  valid_pixels?: number;
+  flood_percentage?: number;
+  detected_area_m2?: number;
+  detected_area_km2?: number;
+  analyzed_area_km2?: number;
+  output_file?: string;
+  area_calculation_method?: string;
+  limitations?: string[];
+  all_polarizations?: Record<string, any>;
+}
+
+interface ReportOverallAssessment {
+  category: string;
+  statement: string;
+  evidence_summary: string[];
+  evidence_items?: Array<{
+    source: string;
+    observation: string;
+    type: string;
+    confidence_note?: string;
+  }>;
+}
+
+interface ReportMethodologyStep {
+  step: number;
+  name: string;
+  description: string;
+}
+
 interface ReportData {
   title: string;
   generated_at: string;
+  executive_summary?: ReportExecutiveSummary;
   location: ReportLocation;
   satellite_observations: SatelliteObservation[];
+  satellite?: { observations: SatelliteObservation[]; source: string };
+  sentinel1?: ReportSentinel1Info | null;
+  preprocessing?: ReportPreprocessingInfo | null;
+  flood_detection?: ReportFloodDetectionInfo | null;
   flood_detections: FloodDetectionRecord[];
   flood_regions: FloodRegionRecord[];
   risk_predictions: RiskPredictionRecord[];
+  risk?: RiskPredictionRecord | null;
   historical_floods: HistoricalFloodRecord[];
   alerts: AlertRecord[];
-  data_provenance: {
-    database: string;
-    satellite: string;
-    risk_model: string;
-  };
+  overall_assessment?: ReportOverallAssessment;
+  methodology?: ReportMethodologyStep[];
+  limitations?: string[];
+  data_provenance: any;
+  provenance_sources?: any;
 }
 
 interface ReportSummary {
@@ -237,6 +330,80 @@ interface Sentinel1DownloadInfoResponse {
   message?: string;
 }
 
+// Sentinel-1 SAR Preprocessing types
+interface SarPreprocessResponse {
+  status: "success" | "already_processed" | "not_found" | "invalid_polarization" | "error";
+  product_id?: string;
+  polarization?: string;
+  source?: string;
+  processing_status?: "COMPLETED" | "ALREADY_EXISTS";
+  output_file?: string;
+  width?: number;
+  height?: number;
+  crs?: string;
+  bounds?: number[];
+  min_value?: number;
+  max_value?: number;
+  mean_value?: number;
+  nodata?: number | null;
+  valid_pixels?: number;
+  total_pixels?: number;
+  processing_pipeline?: string;
+  operations_applied?: string[];
+  calibration_note?: string;
+  message?: string;
+  available_polarizations?: string[];
+}
+
+interface SarStatusResponse {
+  product_id: string;
+  is_downloaded: boolean;
+  available_polarizations: string[];
+  processed_polarizations: string[];
+  processed_metadata: Record<string, SarPreprocessResponse>;
+}
+
+// Sentinel-1 Prototype SAR Flood Detection types
+interface FloodDetectionResponse {
+  status: "success" | "already_processed" | "not_found" | "not_preprocessed" | "invalid_polarization" | "invalid_threshold" | "error";
+  product_id?: string;
+  polarization?: string;
+  threshold_used?: number;
+  processing_method?: string;
+  classification?: string;
+  processing_status?: "COMPLETED" | "ALREADY_EXISTS";
+  output_file?: string;
+  width?: number;
+  height?: number;
+  crs?: string;
+  bounds?: number[];
+  valid_pixels?: number;
+  valid_pixel_count?: number;
+  total_pixels?: number;
+  candidate_flood_pixels?: number;
+  flood_pixel_count?: number;
+  flood_percentage?: number;
+  detected_area_m2?: number;
+  detected_area_km2?: number;
+  analyzed_area_m2?: number;
+  analyzed_area_km2?: number;
+  nodata?: number;
+  method?: string;
+  area_calculation_method?: string;
+  limitations?: string[];
+  message?: string;
+}
+
+interface FloodDetectionStatusResponse {
+  product_id: string;
+  status: "COMPLETED" | "PARTIAL" | "NOT_PROCESSED" | "ALREADY_EXISTS";
+  polarization?: string;
+  processing_status?: string;
+  detected_polarizations?: string[];
+  detected_metadata?: Record<string, FloodDetectionResponse>;
+  metadata?: FloodDetectionResponse;
+}
+
 // Central Selected-Location State
 export let dbLocations: LocationRecord[] = [];
 export let selectedLocationId: number = 1;
@@ -265,802 +432,1715 @@ export function getSelectedLocationState() {
 
 const appRoot = document.querySelector<HTMLDivElement>("#app")!;
 appRoot.innerHTML = `
-  <div class="app">
+<!-- 0. AUTH LOADING OVERLAY -->
+<div id="auth-loading-overlay">
+  <div class="auth-spinner"></div>
+  <div class="auth-loading-text">Authenticating EarthWatch AI...</div>
+</div>
 
-    <!-- NAVBAR -->
-    <header class="navbar">
-      <div class="brand-group">
-        <h1>🌍 EarthWatch-AI</h1>
-        <span class="brand-badge">Disaster Monitoring</span>
+<!-- 0.5 AUTHENTICATION / 4D SPATIAL MISSION CONTROL LOGIN SCREEN -->
+<div id="auth-container" class="auth-page-wrapper" style="display:none;">
+  <!-- DEPTH 01-05: 3D Vector Earth, Atmosphere, Orbital Rings, Satellite & Radar Sweep Canvas -->
+  <canvas id="spatial-earth-canvas" class="spatial-canvas"></canvas>
+
+  <!-- DEPTH 02: Geospatial Coordinates & Analytical Grid Layer -->
+  <div id="spatial-grid-layer" class="spatial-grid-layer">
+    <div class="grid-coords-label coords-top-left">ORBIT: 693 KM // INCL: 98.18° // CDSE SENTINEL-1</div>
+    <div class="grid-coords-label coords-bottom-left">GRID REF: 20.2961° N, 85.8245° E [SAR HOTSPOT - DEMO]</div>
+    <div class="grid-coords-label coords-mid-center">4D SPATIAL FRAMEWORK // LERP: 0.06 // 60 FPS</div>
+  </div>
+
+  <!-- DEPTH 05: Dynamic Orbiting Satellite Telemetry HUD Tag -->
+  <div id="satellite-telemetry-tag" class="satellite-telemetry-tag" style="display:none;">
+    <div class="sat-tag-header">SATELLITE TELEMETRY [DEMO]</div>
+    <div class="sat-tag-title">SENTINEL-1 SAR // C-BAND</div>
+    <div class="sat-tag-meta">
+      <span>ALT: 693 KM</span>
+      <span>VEL: 7.5 KM/S</span>
+      <span>LINK: 98.4%</span>
+    </div>
+    <div class="sat-tag-hint">STATUS: ACQUIRING OBSERVATION</div>
+  </div>
+
+  <!-- DEPTH 06: Holographic Mission Control HUD Panels -->
+  <div id="spatial-hud-layer" class="spatial-hud-layer">
+    <!-- HUD Card Top-Left: SAR Observation & Orbit Tracking -->
+    <div class="hud-bracket-card hud-top-left">
+      <div class="hud-label">SAR OBSERVATION // C-BAND INTERFEROMETRY</div>
+      <div class="hud-val highlight">SENTINEL-1A GRD POLAR</div>
+      <div class="hud-sub">ORBIT TRACKING: LOCKED // SUN-SYNCHRONOUS</div>
+      <div class="hud-bar"><span style="width: 84%"></span></div>
+      <div class="hud-grid-row">
+        <div>POLARIZATION: <strong>VV + VH</strong></div>
+        <div>RESOLUTION: <strong>10M GRD</strong></div>
+      </div>
+    </div>
+
+    <!-- HUD Card Bottom-Left: Earth Observation & Flood Risk Index -->
+    <div class="hud-bracket-card hud-bottom-left">
+      <div class="hud-label">EARTH OBSERVATION // ACTIVE RADAR SWEEP</div>
+      <div class="hud-val">SURFACE INUNDATION MONITORING</div>
+      <div class="hud-sub">AI INFERENCE ENGINE: RESNET-UNET ACTIVE</div>
+      <div class="hud-grid-row">
+        <div>CDSE LINK: <strong>SECURE</strong></div>
+        <div>SAR PIPELINE: <strong>READY</strong></div>
+        <div>ODISHA HOTSPOT: <strong>ACTIVE</strong></div>
+        <div>RADAR SWEEP: <strong>360° CONTINUOUS</strong></div>
+      </div>
+    </div>
+
+    <!-- HUD Card Bottom-Center: Mission Status & Data Link -->
+    <div class="hud-bracket-card hud-bottom-center">
+      <div class="hud-label">MISSION CONTROL STATUS</div>
+      <div class="hud-val highlight">READY FOR ACCESS</div>
+      <div class="hud-sub">SPATIAL ENCRYPTION: ARGON2ID + JWT</div>
+    </div>
+  </div>
+
+  <!-- DEPTH 07: Floating Glass Authentication Console Card -->
+  <div class="auth-container-card spatial-console-card" id="auth-console-card">
+    <div class="auth-brand-header">
+      <div class="auth-logo-badge">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
+          <circle cx="12" cy="12" r="10" stroke="#00f0ff" stroke-width="1.8" />
+          <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" stroke="#38bdf8" stroke-width="1.5" />
+          <circle cx="12" cy="12" r="3" fill="#00f0ff" />
+        </svg>
+      </div>
+      <h1 class="auth-title">EARTHWATCH <span>AI</span></h1>
+      <p class="auth-subtitle">SATELLITE EARTH OBSERVATION &amp; FLOOD INTELLIGENCE PLATFORM</p>
+      <div class="mission-status-pill">
+        <span class="mission-status-led"></span>
+        <span>● SECURE MISSION ACCESS</span>
+      </div>
+    </div>
+
+    <!-- Success Verified Transition Badge -->
+    <div id="auth-success-badge" class="auth-success-badge" style="display:none;">
+      <span>✓</span>
+      <span>ACCESS VERIFIED — INITIALIZING MISSION CONTROL...</span>
+    </div>
+
+    <!-- Alert Banner (Matching exact visual spec) -->
+    <div id="auth-alert-banner" class="auth-alert-banner">
+      <div class="auth-alert-head">
+        <span id="auth-alert-icon">⚠️</span>
+        <span id="auth-alert-title">AUTHENTICATION FAILED</span>
+      </div>
+      <div id="auth-alert-msg" class="auth-alert-body"></div>
+    </div>
+
+    <form id="auth-login-form" class="auth-form" novalidate>
+      <!-- Email Field -->
+      <div class="auth-field-group">
+        <label class="auth-label" for="login-email">
+          <span>EMAIL ADDRESS</span>
+        </label>
+        <div class="auth-input-wrapper">
+          <span class="auth-input-icon">✉️</span>
+          <input
+            type="email"
+            id="login-email"
+            class="auth-input"
+            placeholder="Enter your email"
+            autocomplete="email"
+            spellcheck="false"
+          />
+        </div>
+        <div class="auth-error-msg" id="login-email-error"></div>
       </div>
 
-      <div class="nav-actions">
-        <div class="status-group">
-          <span class="pulse-dot"></span>
-          <span class="status" id="system-status-indicator">Backend Checking...</span>
+      <!-- Password Field -->
+      <div class="auth-field-group">
+        <label class="auth-label" for="login-password">
+          <span>PASSWORD</span>
+        </label>
+        <div class="auth-input-wrapper">
+          <span class="auth-input-icon">🔑</span>
+          <input
+            type="password"
+            id="login-password"
+            class="auth-input"
+            placeholder="Enter your password"
+            autocomplete="current-password"
+          />
+          <button
+            type="button"
+            id="login-password-toggle"
+            class="auth-password-toggle"
+            title="Show/Hide Password"
+            aria-label="Toggle password visibility"
+          >
+            👁️
+          </button>
+        </div>
+        <div class="auth-error-msg" id="login-password-error"></div>
+      </div>
+
+      <!-- Options: Remember Me & Forgot Password -->
+      <div class="auth-options-row">
+        <label class="auth-remember-label">
+          <input type="checkbox" id="login-remember" class="auth-remember-checkbox" />
+          <span>Remember me</span>
+        </label>
+        <button type="button" id="login-forgot-btn" class="auth-forgot-link">
+          Forgot password?
+        </button>
+      </div>
+
+      <!-- Submit Button -->
+      <button type="submit" id="login-submit-btn" class="auth-submit-btn">
+        <span class="btn-glow-sweep"></span>
+        <span id="login-submit-text">SIGN IN</span>
+      </button>
+    </form>
+
+    <!-- Demo Credentials Footer -->
+    <div class="auth-card-footer">
+      <div>Quick Development Credentials:</div>
+      <div class="auth-demo-chips">
+        <button type="button" class="auth-demo-chip" id="demo-chip-admin" title="Fill Admin Credentials">
+          🛡️ Admin (admin@earthwatch.ai)
+        </button>
+        <button type="button" class="auth-demo-chip" id="demo-chip-analyst" title="Fill Analyst Credentials">
+          🔬 Analyst (analyst@earthwatch.ai)
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="app-layout" id="app-layout" style="display:none;">
+
+  <!-- LEFT VERTICAL SIDEBAR -->
+  <aside class="app-sidebar" id="app-sidebar">
+    <div class="sidebar-header">
+      <div class="sidebar-logo">
+        <div class="logo-mark">
+          <svg viewBox="0 0 24 24" class="logo-icon" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10" stroke="#00f0ff" stroke-width="1.8" />
+            <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" stroke="#38bdf8" stroke-width="1.5" />
+            <circle cx="12" cy="12" r="3" fill="#00f0ff" />
+          </svg>
+        </div>
+        <div class="logo-text">
+          <div class="logo-title">EarthWatch <span>AI</span></div>
+          <div class="logo-subtitle">Satellite Intelligence for a Safer Tomorrow</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Navigation List -->
+    <nav class="sidebar-nav">
+      <div class="nav-section-label">CORE INTELLIGENCE</div>
+      <button type="button" class="nav-item active" data-view="dashboard" id="nav-item-dashboard">
+        <span class="nav-icon">📊</span>
+        <span class="nav-label">Dashboard</span>
+      </button>
+      <button type="button" class="nav-item" data-view="satellite" id="nav-item-satellite">
+        <span class="nav-icon">🛰️</span>
+        <span class="nav-label">Satellite</span>
+        <span class="nav-badge-pulse"></span>
+      </button>
+      <button type="button" class="nav-item" data-view="flood-detection" id="nav-item-flood-detection">
+        <span class="nav-icon">🌊</span>
+        <span class="nav-label">Flood Detection</span>
+      </button>
+      <button type="button" class="nav-item" data-view="location-observation" id="nav-item-location-observation">
+        <span class="nav-icon">📍</span>
+        <span class="nav-label">Location Observation</span>
+      </button>
+      <button type="button" class="nav-item" data-view="historical-floods" id="nav-item-historical-floods">
+        <span class="nav-icon">📈</span>
+        <span class="nav-label">Historical Floods</span>
+      </button>
+      <button type="button" class="nav-item" data-view="report" id="nav-item-report">
+        <span class="nav-icon">📑</span>
+        <span class="nav-label">Analysis / Report</span>
+      </button>
+
+      <div class="nav-section-label" style="margin-top:14px;">ANALYTICS &amp; TOOLS</div>
+      <button type="button" class="nav-item" data-view="risk" id="nav-item-risk">
+        <span class="nav-icon">⚠️</span>
+        <span class="nav-label">Risk Predictions</span>
+      </button>
+      <button type="button" class="nav-item" data-view="alerts" id="nav-item-alerts">
+        <span class="nav-icon">🔔</span>
+        <span class="nav-label">Alerts</span>
+        <span class="nav-badge-count" id="sidebar-alert-badge">0</span>
+      </button>
+      <button type="button" class="nav-item" data-view="compare" id="nav-item-compare">
+        <span class="nav-icon">🔄</span>
+        <span class="nav-label">Copernicus Compare</span>
+      </button>
+      <button type="button" class="nav-item" data-view="settings" id="nav-item-settings">
+        <span class="nav-icon">⚙️</span>
+        <span class="nav-label">Settings</span>
+      </button>
+
+      <!-- ADMIN ONLY SECTION -->
+      <div class="nav-section-label admin-only-element" id="nav-section-admin" style="margin-top:14px; display:none;">ADMINISTRATION</div>
+      <button type="button" class="nav-item admin-only-element" data-view="users" id="nav-item-users" style="display:none;">
+        <span class="nav-icon">👥</span>
+        <span class="nav-label">User Management</span>
+      </button>
+    </nav>
+
+    <!-- Sidebar Footer -->
+    <div class="sidebar-footer">
+      <div class="sidebar-status-box">
+        <div class="status-indicator-dot"></div>
+        <div class="status-info">
+          <div class="status-name">EarthWatch Core</div>
+          <div class="status-ver" id="sidebar-engine-status">SQL Server · Online</div>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- MAIN VIEWPORT -->
+  <div class="app-main-viewport">
+
+    <!-- TOP HEADER -->
+    <header class="app-topbar">
+      <div class="topbar-left">
+        <!-- Location Selector with SQL DATABASE provenance -->
+        <div class="topbar-location-control">
+          <span class="location-icon">📍</span>
+          <div class="location-select-wrap">
+            <label for="db-location-select" class="topbar-label">Monitored Location</label>
+            <select id="db-location-select" class="db-select-topbar">
+              <option value="">Loading locations...</option>
+            </select>
+          </div>
         </div>
 
-        <button class="nav-report-btn" id="generate-report-btn">
-          📑 Generate Report
-        </button>
+        <!-- Location Metadata Pill -->
+        <div class="location-meta-pill" id="location-meta-pill">
+          <span>District: <strong id="meta-district">Khordha</strong></span>
+          <span>State: <strong id="meta-state">Odisha</strong></span>
+          <span>Coords: <strong id="meta-coords">20.2961° N, 85.8245° E</strong></span>
+        </div>
 
-        <button class="nav-cdse-btn" id="open-cdse-btn" title="Copernicus Data Space Authentication">
-          🛰️ Copernicus Data Space
-        </button>
+        <!-- OpenWeather Geocoding Search (compact) -->
+        <div class="topbar-search-group">
+          <input id="location-input" type="text" placeholder="Search city..." class="topbar-search-input" />
+          <button id="location-button" class="topbar-search-btn">Search</button>
+        </div>
+      </div>
+
+      <!-- Topbar Right: 4 Real Statistics & Actions -->
+      <div class="topbar-right">
+        <div class="topbar-stats-group">
+          <div class="stat-pill" title="Satellite Observations in current database">
+            <span class="stat-label">Observations</span>
+            <span class="stat-value" id="top-stat-obs">--</span>
+          </div>
+          <div class="stat-pill" title="Flood Detections registered">
+            <span class="stat-label">Detections</span>
+            <span class="stat-value" id="top-stat-floods">--</span>
+          </div>
+          <div class="stat-pill" title="Prototype Flood Risk Score">
+            <span class="stat-label">Prototype Risk</span>
+            <span class="stat-value stat-risk" id="top-stat-risk">--</span>
+          </div>
+          <div class="stat-pill" title="Active Disaster Alerts">
+            <span class="stat-label">Active Alerts</span>
+            <span class="stat-value stat-alert" id="top-stat-alerts">0</span>
+          </div>
+        </div>
+
+        <div class="topbar-actions">
+          <div class="status-group">
+            <span class="pulse-dot"></span>
+            <span class="status" id="system-status-indicator">Backend Checking...</span>
+          </div>
+          <button class="nav-report-btn" id="generate-report-btn" title="Generate comprehensive disaster assessment report">
+            📑 Report
+          </button>
+          <button class="nav-cdse-btn" id="open-cdse-btn" title="Copernicus Data Space Authentication">
+            🛰️ CDSE
+          </button>
+
+          <!-- Topbar User Profile & Logout -->
+          <div class="topbar-user-badge" id="topbar-user-badge" style="display:none;">
+            <div class="topbar-user-avatar" id="topbar-user-avatar">EA</div>
+            <div class="topbar-user-info">
+              <span class="topbar-user-name" id="topbar-user-name">EarthWatch Admin</span>
+              <span class="topbar-user-role admin" id="topbar-user-role">ADMIN</span>
+            </div>
+          </div>
+          <button class="nav-logout-btn" id="logout-btn" style="display:none;" title="Sign out of EarthWatch AI">
+            🚪 Logout
+          </button>
+        </div>
       </div>
     </header>
 
-    <main class="dashboard">
+    <!-- CONTENT SCROLL AREA -->
+    <div class="app-content-scroll" id="main-content-scroll">
 
-      <!-- HERO & CONTROLS -->
-      <section class="hero">
-        <div class="hero-header">
-          <div>
-            <h2>Earth Observation & Flood Intelligence Dashboard</h2>
-            <p>
-              Integrated SQL Server telemetry, Copernicus Sentinel STAC catalogue & prototype flood risk modeling.
-            </p>
-          </div>
-
+      <!-- ============================================== -->
+      <!-- ============================================== -->
+      <!-- VIEW 1: DASHBOARD OVERVIEW & METRICS           -->
+      <!-- ============================================== -->
+      <div class="view-panel active" id="view-dashboard">
+        
+        <div class="section-title-row">
+          <h2 style="font-size:18px; color:var(--text-main);">Earth Observation &amp; Disaster Intelligence Overview</h2>
           <div class="provenance-legend">
-            <span class="legend-title">Data Provenance:</span>
             <span class="provenance-tag tag-db">SQL DATABASE</span>
             <span class="provenance-tag tag-stac">COPERNICUS STAC</span>
             <span class="provenance-tag tag-live">LIVE WEATHER</span>
             <span class="provenance-tag tag-proto">PROTOTYPE MODEL</span>
-            <span class="provenance-tag tag-demo">DEMO DATA</span>
           </div>
         </div>
 
-        <div class="control-panel">
-          <div class="control-group">
-            <label for="db-location-select">
-              📍 Monitored Location <span class="provenance-tag tag-db">SQL DATABASE</span>
-            </label>
-            <select id="db-location-select" class="db-select">
-              <option value="">Loading locations...</option>
-            </select>
-          </div>
-
-          <div class="control-group" style="flex: 1;">
-            <label for="location-input">
-              🔍 OpenWeather Geocoding Search <span class="provenance-tag tag-live">LIVE WEATHER</span>
-            </label>
-            <div class="location-control">
-              <input id="location-input" type="text" placeholder="Or search city (e.g. Cuttack, Puri)..." />
-              <button id="location-button" class="btn-secondary">Search City</button>
+        <!-- METRIC CARDS (9 CORE OBSERVATIONS) -->
+        <section class="cards">
+          <!-- 1. Potential Flood Area -->
+          <div class="card">
+            <div class="card-header-row">
+              <h3>🌊 Potential Flood Area</h3>
+              <span class="provenance-tag tag-db">SQL SERVER</span>
             </div>
+            <p class="value" id="flooded-area">--</p>
+            <span class="card-subtitle" id="flood-extent-subtitle">Database candidate record</span>
           </div>
 
-          <div class="location-meta-pill" id="location-meta-pill">
-            <span>District: <strong id="meta-district">Khordha</strong></span>
-            <span>State: <strong id="meta-state">Odisha</strong></span>
-            <span>Coords: <strong id="meta-coords">20.2961° N, 85.8245° E</strong></span>
+          <!-- 2. Detection Confidence -->
+          <div class="card">
+            <div class="card-header-row">
+              <h3>🎯 Confidence</h3>
+              <span class="provenance-tag tag-proto">PROTOTYPE</span>
+            </div>
+            <p class="value" id="detection-confidence">--</p>
+            <span class="card-subtitle" id="detection-method-subtitle">Prototype / Baseline Detection</span>
           </div>
-        </div>
-      </section>
 
-      <!-- METRIC CARDS (9 CORE OBSERVATIONS) -->
-      <section class="cards">
+          <!-- 3. Satellite Observation -->
+          <div class="card">
+            <div class="card-header-row">
+              <h3>🛰️ Satellite Record</h3>
+              <span class="provenance-tag tag-db">DATABASE</span>
+            </div>
+            <p class="value" id="satellite-observation">--</p>
+            <span class="card-subtitle" id="satellite-meta-subtitle">Sensor &amp; date pending</span>
+          </div>
 
-        <!-- 1. Flooded Area -->
-        <div class="card">
+          <!-- 4. Sentinel-1 SAR Asset -->
+          <div class="card">
+            <div class="card-header-row">
+              <h3>📡 Sentinel-1 SAR</h3>
+              <span class="provenance-tag tag-stac">COPERNICUS STAC</span>
+            </div>
+            <p class="value" id="sar-status">Checking...</p>
+            <span class="card-subtitle" id="sar-details">Copernicus STAC discovery</span>
+          </div>
+
+          <!-- 5. Prototype Risk Score -->
+          <div class="card">
+            <div class="card-header-row">
+              <h3>⚠️ Prototype Risk</h3>
+              <span class="provenance-tag tag-proto">PROTOTYPE</span>
+            </div>
+            <p class="value" id="flood-risk">--</p>
+            <span class="card-subtitle" id="analysis-status">Ready for evaluation</span>
+          </div>
+
+          <!-- 6. Rainfall -->
+          <div class="card">
+            <div class="card-header-row">
+              <h3>🌧️ Rainfall</h3>
+              <span class="provenance-tag tag-live" id="rainfall-source-tag">LIVE WEATHER</span>
+            </div>
+            <p class="value" id="rainfall">--</p>
+            <span class="card-subtitle" id="rainfall-status">Precipitation depth</span>
+          </div>
+
+          <!-- 7. Temperature -->
+          <div class="card">
+            <div class="card-header-row">
+              <h3>🌡️ Temperature</h3>
+              <span class="provenance-tag tag-live">LIVE WEATHER</span>
+            </div>
+            <p class="value" id="temperature">--</p>
+            <span class="card-subtitle" id="condition">Current reading</span>
+          </div>
+
+          <!-- 8. Air Quality -->
+          <div class="card">
+            <div class="card-header-row">
+              <h3>💧 Air Quality</h3>
+              <span class="provenance-tag tag-live">LIVE WEATHER</span>
+            </div>
+            <p class="value" id="air-quality">--</p>
+            <span class="card-subtitle" id="air-quality-status">AQI status</span>
+          </div>
+
+          <!-- 9. Affected Sub-Regions -->
+          <div class="card">
+            <div class="card-header-row">
+              <h3>📍 Affected Regions</h3>
+              <span class="provenance-tag tag-db">SQL SERVER</span>
+            </div>
+            <p class="value" id="affected-regions">--</p>
+            <span class="card-subtitle" id="regions-subtitle">Database sub-regions</span>
+          </div>
+        </section>
+
+        <!-- QUICK ACTIONS -->
+        <section class="quick-actions">
+          <div class="section-title-row">
+            <h3 class="section-title">⚡ Operational Workflows</h3>
+          </div>
+          <div class="action-buttons">
+            <button id="detect-flood-button" class="action-btn">🌊 Flood Detection</button>
+            <button id="compare-button" class="action-btn">🛰️ Compare Satellite Scenes</button>
+            <button id="risk-button" class="action-btn">⚠️ Risk Factor Breakdown</button>
+            <button id="history-button" class="action-btn">📊 Historical Analytics</button>
+            <button id="alerts-button" class="action-btn">🔔 Alert Center</button>
+            <button id="cdse-action-btn" class="action-btn">🛰️ Copernicus Data Space</button>
+            <button id="report-action-btn" class="action-btn">📑 Disaster Assessment Report</button>
+          </div>
+        </section>
+
+        <!-- AI ENVIRONMENTAL INSIGHT -->
+        <section class="card" style="margin-bottom:20px; padding:16px;">
           <div class="card-header-row">
-            <h3>🌊 Flooded Area</h3>
-            <span class="provenance-tag tag-db">SQL SERVER DATABASE</span>
-          </div>
-          <p class="value" id="flooded-area">--</p>
-          <span class="card-subtitle" id="flood-extent-subtitle">Database detection record</span>
-        </div>
-
-        <!-- 2. Detection Confidence -->
-        <div class="card">
-          <div class="card-header-row">
-            <h3>🎯 Confidence</h3>
-            <span class="provenance-tag tag-proto">PROTOTYPE MODEL</span>
-          </div>
-          <p class="value" id="detection-confidence">--</p>
-          <span class="card-subtitle" id="detection-method-subtitle">Prototype / Baseline Detection</span>
-        </div>
-
-        <!-- 3. Satellite Observation -->
-        <div class="card">
-          <div class="card-header-row">
-            <h3>🛰️ Satellite Record</h3>
-            <span class="provenance-tag tag-db">DATABASE OBSERVATION</span>
-          </div>
-          <p class="value" id="satellite-observation">--</p>
-          <span class="card-subtitle" id="satellite-meta-subtitle">Sensor & date pending</span>
-        </div>
-
-        <!-- 4. Sentinel-1 SAR Asset -->
-        <div class="card">
-          <div class="card-header-row">
-            <h3>📡 Sentinel-1 SAR</h3>
-            <span class="provenance-tag tag-stac">LIVE COPERNICUS STAC SEARCH</span>
-          </div>
-          <p class="value" id="sar-status">Checking...</p>
-          <span class="card-subtitle" id="sar-details">Copernicus STAC discovery</span>
-        </div>
-
-        <!-- 5. Flood Risk Score -->
-        <div class="card">
-          <div class="card-header-row">
-            <h3>⚠️ Flood Risk</h3>
-            <span class="provenance-tag tag-proto">PROTOTYPE MODEL</span>
-          </div>
-          <p class="value" id="flood-risk">--</p>
-          <span class="card-subtitle" id="analysis-status">Ready for evaluation</span>
-        </div>
-
-        <!-- 6. Rainfall -->
-        <div class="card">
-          <div class="card-header-row">
-            <h3>🌧️ Rainfall</h3>
-            <span class="provenance-tag tag-live" id="rainfall-source-tag">LIVE WEATHER</span>
-          </div>
-          <p class="value" id="rainfall">--</p>
-          <span class="card-subtitle" id="rainfall-status">Precipitation depth</span>
-        </div>
-
-        <!-- 7. Temperature -->
-        <div class="card">
-          <div class="card-header-row">
-            <h3>🌡️ Temperature</h3>
-            <span class="provenance-tag tag-live">LIVE WEATHER</span>
-          </div>
-          <p class="value" id="temperature">--</p>
-          <span class="card-subtitle" id="condition">Current reading</span>
-        </div>
-
-        <!-- 8. Air Quality -->
-        <div class="card">
-          <div class="card-header-row">
-            <h3>💧 Air Quality</h3>
-            <span class="provenance-tag tag-live">LIVE WEATHER</span>
-          </div>
-          <p class="value" id="air-quality">--</p>
-          <span class="card-subtitle" id="air-quality-status">AQI status</span>
-        </div>
-
-        <!-- 9. Affected Sub-Regions -->
-        <div class="card">
-          <div class="card-header-row">
-            <h3>📍 Affected Regions</h3>
-            <span class="provenance-tag tag-db">SQL SERVER DATABASE</span>
-          </div>
-          <p class="value" id="affected-regions">--</p>
-          <span class="card-subtitle" id="regions-subtitle">Database sub-regions</span>
-        </div>
-
-      </section>
-
-      <!-- QUICK ACTIONS -->
-      <section class="quick-actions">
-        <div class="section-title-row">
-          <h3 class="section-title">⚡ Operational Workflows</h3>
-        </div>
-        <div class="action-buttons">
-          <button id="detect-flood-button" class="action-btn">🌊 Refresh Flood Status</button>
-          <button id="compare-button" class="action-btn">🛰️ Compare Satellite Scenes</button>
-          <button id="risk-button" class="action-btn">⚠️ Risk Factor Breakdown</button>
-          <button id="history-button" class="action-btn">📊 Historical Analytics</button>
-          <button id="alerts-button" class="action-btn">🔔 Alert Center</button>
-          <button id="cdse-action-btn" class="action-btn">🛰️ Copernicus Data Space</button>
-          <button id="report-action-btn" class="action-btn">📑 Disaster Assessment Report</button>
-        </div>
-      </section>
-
-      <!-- ALERT CENTER -->
-      <section class="alert-center-section" id="alert-center-section">
-        <div class="section-title-row">
-          <h3 class="section-title">
-            🔔 Disaster Alert Center <span class="provenance-tag tag-db">DATABASE ALERT</span>
-          </h3>
-          <span id="alert-count-badge" class="provenance-tag tag-proto">0 Active</span>
-        </div>
-        <div id="alerts-container" class="alerts-grid">
-          <div class="state-box">Loading alerts from database...</div>
-        </div>
-      </section>
-
-      <!-- RISK PREDICTION & FACTOR BREAKDOWN -->
-      <section class="risk-section" id="risk-section">
-        <div class="section-title-row">
-          <h3 class="section-title">
-            ⚠️ Environmental Risk Prediction <span class="provenance-tag tag-proto">PROTOTYPE MODEL</span>
-          </h3>
-          <span class="card-subtitle" id="risk-model-name">Model: Random Forest Prototype</span>
-        </div>
-
-        <div class="risk-summary-grid">
-          <div class="risk-gauge-card">
-            <div class="gauge-circle" id="risk-gauge-ring">
-              <span class="gauge-score" id="risk-score-value">--</span>
-              <span class="gauge-label">PROTOTYPE RISK SCORE</span>
+            <div>
+              <h3 style="font-size:14px; color:var(--text-main);">🤖 AI Environmental &amp; Atmospheric Insight</h3>
+              <span class="card-subtitle">Composite live meteorological, air quality &amp; surface indices.</span>
             </div>
-            <div id="risk-level-badge" class="alert-pill pill-medium">EVALUATING</div>
-            <p style="font-size:12px; color:var(--text-dim); margin-top:8px;">
-              Not a certified probabilistic forecast. Based on prototype feature inputs.
-            </p>
+            <span class="provenance-tag tag-live">● Active Telemetry</span>
           </div>
 
-          <div class="risk-factors-grid" id="risk-factors-grid">
-            <div class="risk-factor-item">
-              <div class="factor-label">24h Rainfall</div>
-              <div class="factor-value" id="rf-rainfall">-- mm</div>
+          <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:12px; margin-top:12px;">
+            <div class="card" style="background:var(--bg-card-subtle);">
+              <h3>Overall Condition</h3>
+              <p id="environment-status" style="font-size:14px; font-weight:700; color:var(--accent-cyan); margin:4px 0;">Evaluating...</p>
+              <span class="card-subtitle">Atmospheric and moisture composite</span>
             </div>
-            <div class="risk-factor-item">
-              <div class="factor-label">Accumulated Rain</div>
-              <div class="factor-value" id="rf-accum-rain">-- mm</div>
+            <div class="card" style="background:var(--bg-card-subtle);">
+              <h3>Operational Advisory</h3>
+              <p id="ai-recommendation" style="font-size:13px; font-weight:600; color:var(--text-main); margin:4px 0;">Gathering telemetry...</p>
+              <span class="card-subtitle">Automated operational recommendation</span>
             </div>
-            <div class="risk-factor-item">
-              <div class="factor-label">Temperature</div>
-              <div class="factor-value" id="rf-temperature">-- °C</div>
-            </div>
-            <div class="risk-factor-item">
-              <div class="factor-label">River Distance</div>
-              <div class="factor-value" id="rf-river-dist">-- km</div>
-            </div>
-            <div class="risk-factor-item">
-              <div class="factor-label">Terrain Elevation</div>
-              <div class="factor-value" id="rf-elevation">-- m</div>
-            </div>
-            <div class="risk-factor-item">
-              <div class="factor-label">Slope Degree</div>
-              <div class="factor-value" id="rf-slope">--°</div>
-            </div>
-            <div class="risk-factor-item">
-              <div class="factor-label">Vegetation Index (NDVI)</div>
-              <div class="factor-value" id="rf-ndvi">--</div>
-            </div>
-            <div class="risk-factor-item">
-              <div class="factor-label">Water Index (NDWI)</div>
-              <div class="factor-value" id="rf-ndwi">--</div>
-            </div>
-            <div class="risk-factor-item">
-              <div class="factor-label">Historical Frequency</div>
-              <div class="factor-value" id="rf-freq">-- events</div>
-            </div>
-            <div class="risk-factor-item">
-              <div class="factor-label">Prior Flood Extent</div>
-              <div class="factor-value" id="rf-prior-area">-- km²</div>
+            <div class="card" style="background:var(--bg-card-subtle);">
+              <h3>Risk Assessment</h3>
+              <p id="risk-level" class="risk-low" style="font-size:14px; font-weight:700; margin:4px 0;">Evaluating...</p>
+              <span id="risk-description" class="card-subtitle">No alerts</span>
             </div>
           </div>
-        </div>
-      </section>
+        </section>
 
-      <!-- INTERACTIVE LEAFLET MAP -->
-      <section class="map-section">
-        <div class="section-title-row">
-          <h3 class="section-title">
-            🌊 Interactive Geospatial Flood Map
-          </h3>
-          <div style="display:flex; gap:8px; align-items:center;">
-            <label style="font-size:12px; color:var(--text-muted); cursor:pointer;">
-              <input type="checkbox" id="toggle-demo-boundaries" /> Show Demo Boundary Polygon
-            </label>
+        <!-- DASHBOARD SYSTEM DATA STATUS -->
+        <section class="system-status-section" id="system-status-section">
+          <div class="system-status-header">
+            <h3 style="font-size:13px; font-weight:700; color:var(--text-main);">🖥️ System Data Status &amp; Engine Provenance</h3>
+            <span class="provenance-tag tag-db">System Integrity</span>
           </div>
-        </div>
-
-        <div class="map-wrapper">
-          <div class="map-status-banner">
-            <span id="map-region-status">Loading database-driven geospatial layers...</span>
-            <span id="map-active-coords" style="font-family:monospace;">--</span>
-          </div>
-
-          <div id="map"></div>
-
-          <div class="map-legend-overlay">
-            <div class="map-legend-title">
-              <span>Map Layer Reference</span>
-              <span class="provenance-tag tag-stac">GIS</span>
-            </div>
-            <div class="map-legend-item">
-              <div class="legend-swatch swatch-monitored"></div>
-              <span>Database Monitored Center</span>
-            </div>
-            <div class="map-legend-item">
-              <div class="legend-swatch swatch-flood"></div>
-              <span>Database Flood Regions (if present)</span>
-            </div>
-            <div class="map-legend-item">
-              <div class="legend-swatch swatch-demo"></div>
-              <span>Demo / Prototype Extent Polygon</span>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <!-- HISTORICAL FLOOD ANALYTICS -->
-      <section class="history-section" id="history-section">
-        <div class="section-title-row">
-          <h3 class="section-title">
-            📊 Historical Flood Analytics <span class="provenance-tag tag-db">HISTORICAL DATASET</span>
-          </h3>
-          <span class="card-subtitle" id="history-source-badge">Multi-year records</span>
-        </div>
-
-        <div class="charts-row">
-          <div class="chart-card">
-            <h4>Flooded Area by Year (km²)</h4>
-            <div id="chart-area-container" class="svg-chart-container">
-              <!-- Dynamically generated SVG -->
-            </div>
-          </div>
-
-          <div class="chart-card">
-            <h4>Rainfall by Year (mm)</h4>
-            <div id="chart-rainfall-container" class="svg-chart-container">
-              <!-- Dynamically generated SVG -->
-            </div>
-          </div>
-        </div>
-
-        <div class="history-table-wrapper">
-          <table class="history-table">
-            <thead>
-              <tr>
-                <th>Year</th>
-                <th>Event Date</th>
-                <th>Location</th>
-                <th>Flooded Area</th>
-                <th>Rainfall</th>
-                <th>Duration</th>
-                <th>Severity</th>
-                <th>Data Source</th>
-              </tr>
-            </thead>
-            <tbody id="history-table-body">
-              <tr><td colspan="8" class="state-box">Loading historical records...</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-      <!-- COPERNICUS SATELLITE COMPARISON -->
-      <section class="comparison-section" id="comparison-section">
-        <div class="comparison-header">
-          <div>
-            <h2>🛰️ Satellite Image Comparison & Change Analysis</h2>
-            <p>
-              Direct scene queries to Copernicus Data Space STAC for Sentinel-1 SAR & Sentinel-2 MSI.
-            </p>
-          </div>
-          <span class="provenance-tag tag-stac">Live Copernicus STAC Search</span>
-        </div>
-
-        <div class="comparison-controls">
-          <div class="comparison-control">
-            <label for="comparison-location">Location</label>
-            <select id="comparison-location" class="db-select comparison-location-select">
-              <option value="">Loading locations...</option>
-            </select>
-          </div>
-
-          <div class="comparison-control">
-            <label for="before-date-input">Before Date</label>
-            <input type="date" id="before-date-input" value="2026-09-15" />
-          </div>
-
-          <div class="comparison-control">
-            <label for="after-date-input">After Date</label>
-            <input type="date" id="after-date-input" value="2026-09-19" />
-          </div>
-
-          <button id="load-comparison-button" class="comparison-load-button">
-            🛰️ Query Satellite Scenes
-          </button>
-        </div>
-
-        <div id="comparison-status-banner" class="comparison-status-banner" style="display:none;"></div>
-
-        <div class="comparison-grid" id="comparison-grid">
-          <!-- S1 Before -->
-          <div class="comparison-card" id="card-before-s1">
-            <div class="comparison-card-header">
-              <h3>🛰️ Sentinel-1 Before</h3>
-              <span class="comparison-date-badge" id="before-s1-date">--</span>
-            </div>
-            <div class="satellite-preview" id="before-s1-preview">
-              <img id="before-sentinel1-image" class="satellite-comparison-image" style="display:none;" />
-              <div class="satellite-placeholder" id="before-s1-placeholder">
-                <span>🛰️</span><strong>Sentinel-1 Before</strong>
-                <small>Awaiting query</small>
+          <div class="system-status-grid">
+            <div class="system-status-card">
+              <div class="card-header-row">
+                <span class="status-label">Database</span>
+                <span class="provenance-tag tag-db">SQL Server</span>
               </div>
-            </div>
-            <div class="comparison-info" id="before-s1-info">
-              <p><strong>Product:</strong> <span id="before-s1-product">--</span></p>
-              <p><strong>Source:</strong> <span class="provenance-tag tag-stac">Copernicus STAC</span></p>
-            </div>
-          </div>
-
-          <!-- S1 After -->
-          <div class="comparison-card" id="card-after-s1">
-            <div class="comparison-card-header">
-              <h3>🛰️ Sentinel-1 After</h3>
-              <span class="comparison-date-badge" id="after-s1-date">--</span>
-            </div>
-            <div class="satellite-preview" id="after-s1-preview">
-              <img id="after-sentinel1-image" class="satellite-comparison-image" style="display:none;" />
-              <div class="satellite-placeholder" id="after-s1-placeholder">
-                <span>🛰️</span><strong>Sentinel-1 After</strong>
-                <small>Awaiting query</small>
-              </div>
-            </div>
-            <div class="comparison-info" id="after-s1-info">
-              <p><strong>Product:</strong> <span id="after-s1-product">--</span></p>
-              <p><strong>Source:</strong> <span class="provenance-tag tag-stac">Copernicus STAC</span></p>
-            </div>
-          </div>
-
-          <!-- S2 Before -->
-          <div class="comparison-card" id="card-before-s2">
-            <div class="comparison-card-header">
-              <h3>🌍 Sentinel-2 Before</h3>
-              <span class="comparison-date-badge" id="before-s2-date">--</span>
-            </div>
-            <div class="satellite-preview" id="before-s2-preview">
-              <img id="before-sentinel2-image" class="satellite-comparison-image" style="display:none;" />
-              <div class="satellite-placeholder" id="before-s2-placeholder">
-                <span>🌍</span><strong>Sentinel-2 Before</strong>
-                <small>Awaiting query</small>
-              </div>
-            </div>
-            <div class="comparison-info" id="before-s2-info">
-              <p><strong>Product:</strong> <span id="before-s2-product">--</span></p>
-              <p><strong>Source:</strong> <span class="provenance-tag tag-stac">Copernicus STAC</span></p>
-            </div>
-          </div>
-
-          <!-- S2 After -->
-          <div class="comparison-card" id="card-after-s2">
-            <div class="comparison-card-header">
-              <h3>🌍 Sentinel-2 After</h3>
-              <span class="comparison-date-badge" id="after-s2-date">--</span>
-            </div>
-            <div class="satellite-preview" id="after-s2-preview">
-              <img id="after-sentinel2-image" class="satellite-comparison-image" style="display:none;" />
-              <div class="satellite-placeholder" id="after-s2-placeholder">
-                <span>🌍</span><strong>Sentinel-2 After</strong>
-                <small>Awaiting query</small>
-              </div>
-            </div>
-            <div class="comparison-info" id="after-s2-info">
-              <p><strong>Product:</strong> <span id="after-s2-product">--</span></p>
-              <p><strong>Source:</strong> <span class="provenance-tag tag-stac">Copernicus STAC</span></p>
-            </div>
-          </div>
-        </div>
-
-        <div class="change-result" id="change-result-panel">
-          <h3>📊 Change Analysis</h3>
-          <div class="change-stats">
-            <div class="change-stat">
-              <span>Source Observation</span>
-              <strong id="change-area">Evaluated on request</strong>
-            </div>
-            <div class="change-stat">
-              <span>Visual Image Difference</span>
-              <strong id="change-percentage">--</strong>
-            </div>
-            <div class="change-stat">
-              <span>Verification Status</span>
-              <strong id="change-status">AWAITING QUERY</strong>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <!-- AI ENVIRONMENTAL INSIGHT -->
-      <section class="insight-section">
-        <div class="insight-header">
-          <div>
-            <h2>🤖 AI Environmental & Atmospheric Insight</h2>
-            <p>Composite live meteorological, air quality & surface indices.</p>
-          </div>
-          <span class="insight-badge">● Active Telemetry</span>
-        </div>
-
-        <div class="insight-grid">
-          <div class="insight-card">
-            <h3>Overall Condition</h3>
-            <p id="environment-status" class="insight-status">Evaluating...</p>
-            <span>Atmospheric and moisture composite</span>
-          </div>
-          <div class="insight-card">
-            <h3>Operational Advisory</h3>
-            <p id="ai-recommendation">Gathering environmental telemetry...</p>
-            <span>Automated operational recommendation</span>
-          </div>
-          <div class="insight-card">
-            <h3>Risk Assessment</h3>
-            <p id="risk-level" class="risk-low">Evaluating...</p>
-            <span id="risk-description">No alerts</span>
-          </div>
-        </div>
-      </section>
-
-      <!-- DASHBOARD SYSTEM DATA STATUS -->
-      <section class="system-status-section" id="system-status-section">
-        <div class="system-status-header">
-          <h3>🖥️ System Data Status & Engine Provenance</h3>
-          <span class="provenance-tag tag-db">System Integrity</span>
-        </div>
-        <div class="system-status-grid">
-          <div class="system-status-card">
-            <div class="system-status-card-header">
-              <span class="status-label">Database</span>
-              <span class="provenance-tag tag-db">SQL Server</span>
-            </div>
-            <div class="status-source">SQL Server / EarthWatchAI</div>
-            <div class="status-state" id="sys-status-db">
-              <span style="color:#10b981;">●</span> Status: Connected
-            </div>
-          </div>
-
-          <div class="system-status-card">
-            <div class="system-status-card-header">
-              <span class="status-label">Satellite Search</span>
-              <span class="provenance-tag tag-stac">Copernicus STAC</span>
-            </div>
-            <div class="status-source">Copernicus STAC</div>
-            <div class="status-state" id="sys-status-stac">
-              <span style="color:#38bdf8;">●</span> Status: Available
-            </div>
-          </div>
-
-          <div class="system-status-card">
-            <div class="system-status-card-header">
-              <span class="status-label">Risk Engine</span>
-              <span class="provenance-tag tag-proto">Prototype Model</span>
-            </div>
-            <div class="status-source">Prototype Model</div>
-            <div class="status-state" id="sys-status-risk">
-              <span style="color:#fbbf24;">●</span> Status: Prototype
-            </div>
-          </div>
-
-          <div class="system-status-card">
-            <div class="system-status-card-header">
-              <span class="status-label">Report Engine</span>
-              <span class="provenance-tag tag-db">Database Report</span>
-            </div>
-            <div class="status-source">Database Report</div>
-            <div class="status-state" id="sys-status-report">
-              <span style="color:#10b981;">●</span> Status: Available
-            </div>
-          </div>
-
-          <div class="system-status-card">
-            <div class="system-status-card-header">
-              <span class="status-label">SAR Pipeline</span>
-              <span class="provenance-tag tag-stac">Foundation Layer</span>
-            </div>
-            <div class="status-source">Sentinel-1 GRD / Copernicus STAC</div>
-            <div class="status-state" id="sys-status-sar-pipeline">
-              <span style="color:#94a3b8;">●</span> Status: Checking...
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <!-- SENTINEL-1 SAR ACQUISITION PIPELINE -->
-      <section class="sar-pipeline-section" id="sar-pipeline-section">
-        <div class="section-title-row">
-          <h3 class="section-title">
-            📡 Sentinel-1 SAR Acquisition Pipeline
-            <span class="provenance-tag tag-stac">COPERNICUS STAC</span>
-          </h3>
-          <span class="provenance-tag tag-proto">FOUNDATION LAYER — NO S3 DOWNLOAD</span>
-        </div>
-
-        <div class="sar-pipeline-info-bar">
-          <span>🗄️ Local Scene Registry: <strong id="sar-registry-total">--</strong> scenes discovered</span>
-          <span>⏱️ Last Discovery: <strong id="sar-last-discovery">--</strong></span>
-          <button id="sar-discover-btn" class="action-btn" style="padding:6px 14px; font-size:12px;">
-            🔍 Run Scene Discovery (Bhubaneswar)
-          </button>
-        </div>
-
-        <div class="sar-pipeline-stages" id="sar-pipeline-stages">
-          <div class="state-box">Loading SAR pipeline status...</div>
-        </div>
-
-        <div class="sar-registry-table-wrapper" id="sar-registry-table-wrapper" style="display:none;">
-          <h4 style="margin:0 0 8px; font-size:13px; color:var(--text-muted);">📋 Catalogued Scenes (Registry)</h4>
-          <table class="history-table" id="sar-registry-table">
-            <thead>
-              <tr>
-                <th>Product ID</th>
-                <th>Location</th>
-                <th>Acquisition Date</th>
-                <th>Platform</th>
-                <th>VV Asset</th>
-                <th>Status</th>
-                <th>Discovered At</th>
-              </tr>
-            </thead>
-            <tbody id="sar-registry-tbody">
-              <tr><td colspan="7" class="state-box">No scenes catalogued yet.</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-      <!-- SENTINEL-1 SAR PRODUCT DISCOVERY -->
-      <section class="s1-discovery-section" id="s1-discovery-section">
-        <div class="section-title-row">
-          <h3 class="section-title">
-            🛰️ Sentinel-1 SAR Product Discovery
-            <span class="provenance-tag tag-stac">COPERNICUS DATA SPACE</span>
-          </h3>
-          <span class="provenance-tag tag-proto">CONTROLLED PRODUCT ACQUISITION</span>
-        </div>
-
-        <div class="s1-discovery-info-bar">
-          <div class="s1-discovery-badges">
-            <span class="provenance-tag tag-stac">COPERNICUS DATA SPACE</span>
-            <span class="provenance-tag tag-proto">CONTROLLED SINGLE-PRODUCT ACQUISITION</span>
-          </div>
-          <div class="s1-discovery-meta">
-            <span>📍 Location: <strong id="s1-location-name">--</strong></span>
-            <span>📦 Products Found: <strong id="s1-product-count">--</strong></span>
-            <span>📅 Search Window: <strong>Last 7 days</strong></span>
-          </div>
-          <button id="s1-refresh-btn" class="action-btn" style="padding:6px 14px; font-size:12px;">
-            🔍 Refresh Discovery
-          </button>
-        </div>
-
-        <div class="s1-discovery-notice">
-          ⚠️ <strong>Data Honesty Notice:</strong> This panel enables <strong>controlled single-product Sentinel-1 downloads</strong>.
-          Products are not automatically downloaded. Select a specific product to download and store locally.
-          Downloading a product does not yet perform SAR preprocessing or flood detection.
-        </div>
-
-        <div id="s1-discovery-status" class="s1-discovery-status-bar" style="display:none;"></div>
-
-        <div id="s1-products-container" class="s1-products-container">
-          <div class="state-box">Querying Copernicus Data Space for Sentinel-1 products...</div>
-        </div>
-      </section>
-
-    </main>
-
-    <!-- DISASTER ASSESSMENT REPORT MODAL -->
-    <div id="report-modal" class="modal-backdrop" style="display:none;">
-      <div class="modal-window">
-        <div class="modal-header">
-          <h3>📑 EarthWatch AI — Disaster Assessment Summary</h3>
-          <div class="modal-actions">
-            <button id="print-report-btn" class="modal-btn-print">🖨️ Print / Save PDF</button>
-            <button id="close-report-btn" class="modal-btn-close">&times;</button>
-          </div>
-        </div>
-        <div class="modal-body" id="report-modal-content">
-          <div class="state-box">Generating comprehensive assessment dossier...</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- COPERNICUS DATA SPACE AUTHENTICATION MODAL -->
-    <div id="cdse-modal" class="modal-backdrop" style="display:none;">
-      <div class="modal-window cdse-modal-window">
-        <div class="modal-header">
-          <div class="cdse-modal-title-group">
-            <h3 style="margin:0; font-size:18px; color:#38bdf8; font-weight:800; letter-spacing:0.5px;">COPERNICUS DATA SPACE</h3>
-            <span class="cdse-modal-subtitle" style="font-size:13px; color:#94a3b8;">Sentinel-1 Data Access</span>
-          </div>
-          <div class="modal-actions">
-            <button id="close-cdse-btn" class="modal-btn-close">&times;</button>
-          </div>
-        </div>
-
-        <div class="modal-body">
-          <div class="cdse-panel">
-
-            <!-- Security Notice -->
-            <div class="cdse-security-notice">
-              <span class="cdse-security-icon">🔒</span>
-              <div class="cdse-security-text">
-                Copernicus credentials are stored securely on the EarthWatch AI backend and are never exposed in the browser.
+              <div class="status-source">SQL Server / EarthWatchAI</div>
+              <div class="status-state" id="sys-status-db">
+                <span style="color:#10b981;">●</span> Status: Connected
               </div>
             </div>
 
-            <!-- Auth Status Card -->
-            <div class="cdse-status-card">
-              <div class="cdse-status-card-header">
-                <span class="cdse-section-label">Authentication Status</span>
-                <span class="provenance-tag tag-stac">COPERNICUS DATA SPACE</span>
+            <div class="system-status-card">
+              <div class="card-header-row">
+                <span class="status-label">Satellite Search</span>
+                <span class="provenance-tag tag-stac">Copernicus STAC</span>
               </div>
-              <div class="cdse-status-display" id="cdse-status-display">
-                <span class="cdse-status-text status-not-configured" id="cdse-status-text">● Not Configured</span>
-              </div>
-              <div class="cdse-status-message" id="cdse-status-message">
-                Copernicus Data Space credentials are not configured.
+              <div class="status-source">Copernicus STAC</div>
+              <div class="status-state" id="sys-status-stac">
+                <span style="color:#38bdf8;">●</span> Status: Available
               </div>
             </div>
 
-            <!-- Backend Credentials -->
-            <div class="cdse-credentials-card">
-              <div class="cdse-section-label">Backend Credentials</div>
-              <div class="cdse-credential-banner">
-                Configured securely through server environment
+            <div class="system-status-card">
+              <div class="card-header-row">
+                <span class="status-label">Risk Engine</span>
+                <span class="provenance-tag tag-proto">Prototype Model</span>
               </div>
-              <div class="cdse-credentials-info">
-                <div class="cdse-credential-row">
-                  <span class="cdse-cred-label">Configuration</span>
-                  <span class="cdse-cred-value">Managed in <code>backend/.env</code> (server-side only)</span>
+              <div class="status-source">Prototype Model</div>
+              <div class="status-state" id="sys-status-risk">
+                <span style="color:#fbbf24;">●</span> Status: Prototype
+              </div>
+            </div>
+
+            <div class="system-status-card">
+              <div class="card-header-row">
+                <span class="status-label">Report Engine</span>
+                <span class="provenance-tag tag-db">Database Report</span>
+              </div>
+              <div class="status-source">Database Report</div>
+              <div class="status-state" id="sys-status-report">
+                <span style="color:#10b981;">●</span> Status: Available
+              </div>
+            </div>
+
+            <div class="system-status-card">
+              <div class="card-header-row">
+                <span class="status-label">SAR Pipeline</span>
+                <span class="provenance-tag tag-stac">Foundation</span>
+              </div>
+              <div class="status-source">Sentinel-1 GRD / Copernicus</div>
+              <div class="status-state" id="sys-status-sar-pipeline">
+                <span style="color:#94a3b8;">●</span> Status: Checking...
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- SENTINEL-1 SAR ACQUISITION PIPELINE -->
+        <section class="card" id="sar-pipeline-section" style="padding:16px;">
+          <div class="section-title-row">
+            <h3 class="section-title">
+              📡 Sentinel-1 SAR Acquisition Pipeline
+              <span class="provenance-tag tag-stac">COPERNICUS STAC</span>
+            </h3>
+            <span class="provenance-tag tag-proto">FOUNDATION LAYER — NO S3 DOWNLOAD</span>
+          </div>
+
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; font-size:12px;">
+            <span>🗄️ Local Scene Registry: <strong id="sar-registry-total">--</strong> scenes discovered</span>
+            <span>⏱️ Last Discovery: <strong id="sar-last-discovery">--</strong></span>
+            <button id="sar-discover-btn" class="action-btn" style="padding:5px 12px; font-size:11.5px;">
+              🔍 Run Scene Discovery (Bhubaneswar)
+            </button>
+          </div>
+
+          <div class="sar-pipeline-stages" id="sar-pipeline-stages">
+            <div class="state-box">Loading SAR pipeline status...</div>
+          </div>
+
+          <div class="sar-registry-table-wrapper" id="sar-registry-table-wrapper" style="display:none; margin-top:12px;">
+            <h4 style="margin:0 0 8px; font-size:12px; color:var(--text-muted);">📋 Catalogued Scenes (Registry)</h4>
+            <table class="history-table" id="sar-registry-table">
+              <thead>
+                <tr>
+                  <th>Product ID</th>
+                  <th>Location</th>
+                  <th>Acquisition Date</th>
+                  <th>Platform</th>
+                  <th>VV Asset</th>
+                  <th>Status</th>
+                  <th>Discovered At</th>
+                </tr>
+              </thead>
+              <tbody id="sar-registry-tbody">
+                <tr><td colspan="7" class="state-box">No scenes catalogued yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+      </div> <!-- /view-dashboard -->
+
+      <!-- ============================================== -->
+      <!-- VIEW 2: SATELLITE DISCOVERY & OBSERVATION      -->
+      <!-- ============================================== -->
+      <div class="view-panel" id="view-satellite">
+        
+        <!-- PAGE HEADER -->
+        <div class="s1-page-header">
+          <div class="s1-title-group">
+            <div class="s1-icon-badge">🛰️</div>
+            <div>
+              <h2 class="s1-page-title">Sentinel-1 Satellite Discovery &amp; Products</h2>
+              <p class="s1-page-subtitle">Search, discover, and inspect Copernicus Sentinel-1 SAR satellite acquisitions for monitored sites.</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- MAIN 3-COLUMN CONTENT GRID -->
+        <div class="s1-main-grid">
+
+          <!-- 1. LEFT / LARGE: MAP VIEW -->
+          <div class="dashboard-panel map-panel">
+            <div class="panel-header">
+              <div class="panel-header-left">
+                <span class="panel-icon">🗺️</span>
+                <h3 class="panel-title">Map View</h3>
+                <span id="map-region-status" class="map-badge-status">Loading layers...</span>
+              </div>
+              <div class="panel-header-right">
+                <span id="map-active-coords" class="map-coords-badge">--</span>
+                <label class="toggle-boundary-label">
+                  <input type="checkbox" id="toggle-demo-boundaries" />
+                  <span>Demo Boundary</span>
+                </label>
+              </div>
+            </div>
+
+            <div class="map-inner-container">
+              <div id="map"></div>
+
+              <!-- Sleek Integrated Map Legend -->
+              <div class="map-legend-bar">
+                <div class="legend-chip">
+                  <span class="legend-dot dot-monitored"></span>
+                  <span>Database Center</span>
                 </div>
-                <div class="cdse-credential-row">
-                  <span class="cdse-cred-label">Variables</span>
-                  <span class="cdse-cred-value"><code>CDSE_USERNAME</code> &amp; <code>CDSE_PASSWORD</code></span>
+                <div class="legend-chip">
+                  <span class="legend-dot dot-flood"></span>
+                  <span>Flood Regions</span>
                 </div>
-                <div class="cdse-credential-row">
-                  <span class="cdse-cred-label">Browser Access</span>
-                  <span class="cdse-cred-value cdse-cred-secure">✓ None — credentials never leave the server</span>
+                <div class="legend-chip">
+                  <span class="legend-dot dot-demo"></span>
+                  <span>Demo Boundary</span>
+                </div>
+                <div class="legend-chip">
+                  <span class="legend-dot dot-aoi"></span>
+                  <span>Sentinel-1 AOI</span>
                 </div>
               </div>
-              <p class="cdse-no-input-note">
-                Security Policy: Username and password inputs are intentionally omitted from this interface.
-                Copernicus credentials are stored securely on the EarthWatch AI backend and are never exposed in the browser.
+            </div>
+          </div>
+
+          <!-- 2. MIDDLE: SENTINEL-1 PRODUCTS -->
+          <div class="dashboard-panel products-panel">
+            <div class="panel-header">
+              <div class="panel-header-left">
+                <span class="panel-icon">📡</span>
+                <h3 class="panel-title">Sentinel-1 Products</h3>
+                <span id="s1-product-count" class="badge-count">--</span>
+              </div>
+              <div class="panel-header-right">
+                <span class="panel-sub-label">📍 <strong id="s1-location-name">--</strong></span>
+                <button id="s1-refresh-btn" class="action-btn-icon" title="Refresh Copernicus Data Space Search">
+                  🔄
+                </button>
+              </div>
+            </div>
+
+            <div id="s1-discovery-status" class="s1-discovery-status-bar" style="display:none;"></div>
+
+            <!-- Scrollable product list container -->
+            <div id="s1-products-container" class="s1-products-scroll-list">
+              <div class="state-box">Querying Copernicus Data Space for Sentinel-1 products...</div>
+            </div>
+          </div>
+
+          <!-- 3. RIGHT: PRODUCT DETAILS -->
+          <div class="dashboard-panel details-panel">
+            <div class="panel-header">
+              <div class="panel-header-left">
+                <span class="panel-icon">📋</span>
+                <h3 class="panel-title">Product Details</h3>
+              </div>
+              <div class="panel-header-right">
+                <span class="provenance-tag tag-stac">METADATA</span>
+              </div>
+            </div>
+
+            <div class="product-details-body" id="product-details-body">
+              <!-- Dynamically populated or empty state -->
+              <div class="empty-details-state" id="empty-details-state">
+                <div class="empty-icon">🛰️</div>
+                <div class="empty-title">No Product Selected</div>
+                <div class="empty-desc">Click any Sentinel-1 product from the list to view comprehensive radar acquisition metadata, polarizations, orbit directions, and processing options.</div>
+              </div>
+              <div class="active-details-content" id="active-details-content" style="display:none;">
+                <!-- Full product attributes -->
+              </div>
+            </div>
+          </div>
+
+        </div>
+
+      </div> <!-- /view-satellite -->
+
+      <!-- ============================================== -->
+      <!-- VIEW 3: SAR PREPROCESSING & FLOOD DETECTION   -->
+      <!-- ============================================== -->
+      <div class="view-panel" id="view-flood-detection">
+        
+        <!-- PAGE HEADER -->
+        <div class="s1-page-header">
+          <div class="s1-title-group">
+            <div class="s1-icon-badge">🌊</div>
+            <div>
+              <h2 class="s1-page-title">SAR Preprocessing &amp; Flood Detection</h2>
+              <p class="s1-page-subtitle">End-to-end radar analysis pipeline for surface inundation detection and low-backscatter candidate mask generation.</p>
+            </div>
+          </div>
+
+          <!-- WORKFLOW STEPPER -->
+          <div class="workflow-stepper" id="workflow-stepper">
+            <!-- Step 1: Discover -->
+            <div class="stepper-step completed" id="step-1-discover" style="cursor:pointer;" title="Go to Satellite Discovery">
+              <div class="step-indicator">
+                <span class="step-num">1</span>
+                <span class="step-check">✓</span>
+              </div>
+              <div class="step-text">
+                <div class="step-title">1 Discover</div>
+                <div class="step-desc">Search Sentinel-1</div>
+              </div>
+            </div>
+            <div class="stepper-line completed" id="stepper-line-1"></div>
+
+            <!-- Step 2: Download -->
+            <div class="stepper-step active" id="step-2-download" style="cursor:pointer;" title="View Product Download Status">
+              <div class="step-indicator">
+                <span class="step-num">2</span>
+                <span class="step-check">✓</span>
+              </div>
+              <div class="step-text">
+                <div class="step-title">2 Download</div>
+                <div class="step-desc">Get Product</div>
+              </div>
+            </div>
+            <div class="stepper-line" id="stepper-line-2"></div>
+
+            <!-- Step 3: Preprocess -->
+            <div class="stepper-step" id="step-3-preprocess" style="cursor:pointer;" title="Run SAR Preprocessing">
+              <div class="step-indicator">
+                <span class="step-num">3</span>
+                <span class="step-check">✓</span>
+              </div>
+              <div class="step-text">
+                <div class="step-title">3 Preprocess</div>
+                <div class="step-desc">Process SAR</div>
+              </div>
+            </div>
+            <div class="stepper-line" id="stepper-line-3"></div>
+
+            <!-- Step 4: Flood Detection -->
+            <div class="stepper-step pending" id="step-4-detection" style="cursor:pointer;" title="Prototype SAR Flood Detection">
+              <div class="step-indicator">
+                <span class="step-num">4</span>
+                <span class="step-check">✓</span>
+              </div>
+              <div class="step-text">
+                <div class="step-title">4 Flood Detection</div>
+                <div class="step-desc" id="step-4-desc">Low-Backscatter</div>
+              </div>
+            </div>
+            <div class="stepper-line" id="stepper-line-4"></div>
+
+            <!-- Step 5: Analysis & Report -->
+            <div class="stepper-step pending" id="step-5-report" style="cursor:pointer;" title="Open Disaster Assessment Report">
+              <div class="step-indicator">
+                <span class="step-num">5</span>
+                <span class="step-check">✓</span>
+              </div>
+              <div class="step-text">
+                <div class="step-title">5 Analysis &amp; Report</div>
+                <div class="step-desc" id="step-5-desc">Generate Dossier</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- PIPELINE CONTROL BAR -->
+        <div class="flood-ctrl-panel" id="flood-ctrl-panel">
+          <div class="flood-ctrl-row">
+            <div class="flood-ctrl-item">
+              <span class="card-subtitle">Active Site</span>
+              <strong id="flood-ctrl-location" style="color:var(--text-main); font-size:13px;">--</strong>
+            </div>
+            <div class="flood-ctrl-item">
+              <span class="card-subtitle">Active Sentinel-1 Product</span>
+              <code id="flood-ctrl-product-id" style="font-size:11px; color:var(--accent-cyan); max-width:320px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:block;">--</code>
+            </div>
+            <div class="flood-ctrl-actions">
+              <button type="button" class="action-btn" id="flood-ctrl-preprocess-btn" style="padding:7px 16px; font-size:12px;">
+                ⚙️ Preprocess SAR
+              </button>
+              <button type="button" class="action-btn btn-flood-action" id="flood-ctrl-detect-btn" style="padding:7px 16px; font-size:12px;">
+                🌊 Run Flood Detection
+              </button>
+              <button type="button" class="action-btn" id="flood-ctrl-report-btn" style="padding:7px 16px; font-size:12px;">
+                📑 View Dossier
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- BOTTOM ROW PANELS -->
+        <div class="s1-bottom-grid">
+
+          <!-- BOTTOM LEFT: PROCESSING RESULTS -->
+          <div class="dashboard-panel results-panel">
+            <div class="panel-header">
+              <div class="panel-header-left">
+                <span class="panel-icon">⚙️</span>
+                <h3 class="panel-title">Processing Results</h3>
+              </div>
+              <div class="panel-header-right">
+                <span class="provenance-tag tag-proto">PROTOTYPE SAR &amp; FLOOD</span>
+              </div>
+            </div>
+
+            <div class="results-panel-body" id="global-processing-results-body">
+              <div class="empty-results-state" id="empty-results-state">
+                <div class="empty-results-icon">🌊</div>
+                <div class="empty-title">No Flood Detection Data Available</div>
+                <div class="empty-desc">No flood detection data available for this location. Select a Sentinel-1 product from the Satellite section to run SAR preprocessing and flood classification.</div>
+              </div>
+              <div class="active-results-content" id="active-results-content" style="display:none;">
+                <!-- Dynamically populated -->
+              </div>
+            </div>
+          </div>
+
+          <!-- BOTTOM RIGHT: PROCESSING STATUS -->
+          <div class="dashboard-panel status-timeline-panel">
+            <div class="panel-header">
+              <div class="panel-header-left">
+                <span class="panel-icon">📈</span>
+                <h3 class="panel-title">Processing Status</h3>
+              </div>
+              <div class="panel-header-right">
+                <span class="timeline-live-badge" id="timeline-live-badge">IDLE</span>
+              </div>
+            </div>
+
+            <div class="timeline-panel-body">
+              <div class="processing-timeline" id="processing-timeline">
+                <!-- 1. Product Validated -->
+                <div class="timeline-node completed" id="tl-node-validate">
+                  <div class="node-icon-circle">✓</div>
+                  <div class="node-label">Product Validated</div>
+                  <div class="node-sub" id="tl-sub-validate">STAC Metadata Verified</div>
+                </div>
+                <div class="timeline-connector" id="tl-conn-1"></div>
+
+                <!-- 2. Downloading -->
+                <div class="timeline-node pending" id="tl-node-download">
+                  <div class="node-icon-circle">2</div>
+                  <div class="node-label">Downloading</div>
+                  <div class="node-sub" id="tl-sub-download">Awaiting download</div>
+                </div>
+                <div class="timeline-connector" id="tl-conn-2"></div>
+
+                <!-- 3. Preprocessing -->
+                <div class="timeline-node pending" id="tl-node-preprocess">
+                  <div class="node-icon-circle">3</div>
+                  <div class="node-label">Preprocessing</div>
+                  <div class="node-sub" id="tl-sub-preprocess">Awaiting processing</div>
+                </div>
+                <div class="timeline-connector" id="tl-conn-3"></div>
+
+                <!-- 4. Flood Detection -->
+                <div class="timeline-node coming-soon" id="tl-node-flood">
+                  <div class="node-icon-circle">4</div>
+                  <div class="node-label">Flood Detection</div>
+                  <div class="node-sub" id="tl-sub-flood">Low-backscatter mask</div>
+                </div>
+                <div class="timeline-connector" id="tl-conn-4"></div>
+
+                <!-- 5. Analysis & Report -->
+                <div class="timeline-node coming-soon" id="tl-node-report">
+                  <div class="node-icon-circle">5</div>
+                  <div class="node-label">Analysis &amp; Report</div>
+                  <div class="node-sub" id="tl-sub-report">Disaster Dossier</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+
+      </div> <!-- /view-flood-detection -->
+
+      <!-- ============================================== -->
+      <!-- VIEW 4: LOCATION OBSERVATION & SITE TELEMETRY -->
+      <!-- ============================================== -->
+      <div class="view-panel" id="view-location-observation">
+        
+        <!-- PAGE HEADER -->
+        <div class="s1-page-header">
+          <div class="s1-title-group">
+            <div class="s1-icon-badge">📍</div>
+            <div>
+              <h2 class="s1-page-title">Location Observation &amp; Site Telemetry</h2>
+              <p class="s1-page-subtitle">Comprehensive multi-source hydro-meteorological observation, satellite coverage, and risk intelligence for monitored locations.</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- LOCATION SELECTOR & SITE PROVENANCE CARD -->
+        <div class="loc-obs-control-panel">
+          <div class="loc-obs-control-left">
+            <span class="location-icon" style="font-size:20px;">📍</span>
+            <div>
+              <label for="loc-obs-select" class="topbar-label" style="display:block; margin-bottom:3px;">Monitored Location</label>
+              <select id="loc-obs-select" class="db-select" style="min-width:240px;">
+                <option value="">Loading database locations...</option>
+              </select>
+            </div>
+            <div style="margin-left:8px;">
+              <span id="loc-obs-meta" class="provenance-tag tag-db">--</span>
+              <span id="loc-obs-id-badge" class="provenance-tag tag-stac">LOC-1</span>
+            </div>
+          </div>
+          <div class="loc-obs-control-right">
+            <span class="card-subtitle">Coordinates:</span>
+            <span id="loc-obs-coords" class="map-coords-badge">--</span>
+          </div>
+        </div>
+
+        <!-- OBSERVATION CARDS GRID -->
+        <div class="loc-obs-grid">
+
+          <!-- CARD 1: SATELLITE OBSERVATIONS -->
+          <div class="loc-obs-card">
+            <div class="panel-header">
+              <div class="panel-header-left">
+                <span class="panel-icon">🛰️</span>
+                <h3 class="panel-title">Satellite Observations</h3>
+              </div>
+              <div class="panel-header-right">
+                <span class="provenance-tag tag-db">DATABASE OBSERVATION</span>
+              </div>
+            </div>
+            <div class="loc-obs-card-body" id="loc-obs-sat-body">
+              <div class="state-box">Loading satellite observations...</div>
+            </div>
+          </div>
+
+          <!-- CARD 2: FLOOD INFORMATION -->
+          <div class="loc-obs-card">
+            <div class="panel-header">
+              <div class="panel-header-left">
+                <span class="panel-icon">🌊</span>
+                <h3 class="panel-title">Flood Information</h3>
+              </div>
+              <div class="panel-header-right">
+                <span class="provenance-tag tag-db">SQL SERVER / SAR</span>
+              </div>
+            </div>
+            <div class="loc-obs-card-body" id="loc-obs-flood-body">
+              <div class="state-box">Loading flood detection records...</div>
+            </div>
+          </div>
+
+          <!-- CARD 3: RISK INFORMATION -->
+          <div class="loc-obs-card">
+            <div class="panel-header">
+              <div class="panel-header-left">
+                <span class="panel-icon">⚠️</span>
+                <h3 class="panel-title">Risk Information</h3>
+              </div>
+              <div class="panel-header-right">
+                <span class="provenance-tag tag-proto">PROTOTYPE MODEL</span>
+              </div>
+            </div>
+            <div class="loc-obs-card-body" id="loc-obs-risk-body">
+              <div class="state-box">Loading risk prediction...</div>
+            </div>
+          </div>
+
+          <!-- CARD 4: WARNING ALERTS -->
+          <div class="loc-obs-card">
+            <div class="panel-header">
+              <div class="panel-header-left">
+                <span class="panel-icon">🔔</span>
+                <h3 class="panel-title">Active Alerts</h3>
+              </div>
+              <div class="panel-header-right">
+                <span class="provenance-tag tag-db">DATABASE ALERT</span>
+              </div>
+            </div>
+            <div class="loc-obs-card-body" id="loc-obs-alerts-body">
+              <div class="state-box">Loading alerts...</div>
+            </div>
+          </div>
+
+          <!-- CARD 5: OBSERVATION STATUS & LIVE TELEMETRY -->
+          <div class="loc-obs-card" style="grid-column: 1 / -1;">
+            <div class="panel-header">
+              <div class="panel-header-left">
+                <span class="panel-icon">🖥️</span>
+                <h3 class="panel-title">Observation Status &amp; Live Telemetry</h3>
+              </div>
+              <div class="panel-header-right">
+                <span class="provenance-tag tag-live">● LIVE TELEMETRY</span>
+              </div>
+            </div>
+            <div class="loc-obs-card-body" id="loc-obs-status-body">
+              <div class="state-box">Gathering live telemetry...</div>
+            </div>
+          </div>
+
+        </div>
+
+      </div> <!-- /view-location-observation -->
+
+      <!-- ============================================== -->
+      <!-- VIEW 3: COPERNICUS SATELLITE COMPARISON        -->
+      <!-- ============================================== -->
+      <div class="view-panel" id="view-compare">
+        <section class="comparison-section" id="comparison-section">
+          <div class="comparison-header">
+            <div>
+              <h2 style="font-size:17px; font-weight:700; color:var(--text-main);">🛰️ Satellite Image Comparison & Change Analysis</h2>
+              <p style="font-size:12px; color:var(--text-secondary);">Direct scene queries to Copernicus Data Space STAC for Sentinel-1 SAR & Sentinel-2 MSI.</p>
+            </div>
+            <span class="provenance-tag tag-stac">Live Copernicus STAC Search</span>
+          </div>
+
+          <div class="comparison-controls">
+            <div class="comparison-control">
+              <label for="comparison-location">Location</label>
+              <select id="comparison-location" class="db-select comparison-location-select">
+                <option value="">Loading locations...</option>
+              </select>
+            </div>
+
+            <div class="comparison-control">
+              <label for="before-date-input">Before Date</label>
+              <input type="date" id="before-date-input" value="2026-09-15" />
+            </div>
+
+            <div class="comparison-control">
+              <label for="after-date-input">After Date</label>
+              <input type="date" id="after-date-input" value="2026-09-19" />
+            </div>
+
+            <button id="load-comparison-button" class="comparison-load-button">
+              🛰️ Query Satellite Scenes
+            </button>
+          </div>
+
+          <div id="comparison-status-banner" class="comparison-status-banner" style="display:none;"></div>
+
+          <div class="comparison-grid" id="comparison-grid">
+            <!-- S1 Before -->
+            <div class="comparison-card" id="card-before-s1">
+              <div class="card-header-row">
+                <h3 style="font-size:12px; font-weight:700;">🛰️ Sentinel-1 Before</h3>
+                <span class="provenance-tag tag-stac" id="before-s1-date">--</span>
+              </div>
+              <div class="satellite-preview" id="before-s1-preview">
+                <img id="before-sentinel1-image" class="satellite-comparison-image" style="display:none;" />
+                <div class="satellite-placeholder" id="before-s1-placeholder">
+                  <span>🛰️</span><strong>Sentinel-1 Before</strong>
+                  <small>Awaiting query</small>
+                </div>
+              </div>
+              <div class="comparison-info" id="before-s1-info">
+                <p><strong>Product:</strong> <span id="before-s1-product">--</span></p>
+                <p><strong>Source:</strong> <span class="provenance-tag tag-stac">Copernicus STAC</span></p>
+              </div>
+            </div>
+
+            <!-- S1 After -->
+            <div class="comparison-card" id="card-after-s1">
+              <div class="card-header-row">
+                <h3 style="font-size:12px; font-weight:700;">🛰️ Sentinel-1 After</h3>
+                <span class="provenance-tag tag-stac" id="after-s1-date">--</span>
+              </div>
+              <div class="satellite-preview" id="after-s1-preview">
+                <img id="after-sentinel1-image" class="satellite-comparison-image" style="display:none;" />
+                <div class="satellite-placeholder" id="after-s1-placeholder">
+                  <span>🛰️</span><strong>Sentinel-1 After</strong>
+                  <small>Awaiting query</small>
+                </div>
+              </div>
+              <div class="comparison-info" id="after-s1-info">
+                <p><strong>Product:</strong> <span id="after-s1-product">--</span></p>
+                <p><strong>Source:</strong> <span class="provenance-tag tag-stac">Copernicus STAC</span></p>
+              </div>
+            </div>
+
+            <!-- S2 Before -->
+            <div class="comparison-card" id="card-before-s2">
+              <div class="card-header-row">
+                <h3 style="font-size:12px; font-weight:700;">🌍 Sentinel-2 Before</h3>
+                <span class="provenance-tag tag-stac" id="before-s2-date">--</span>
+              </div>
+              <div class="satellite-preview" id="before-s2-preview">
+                <img id="before-sentinel2-image" class="satellite-comparison-image" style="display:none;" />
+                <div class="satellite-placeholder" id="before-s2-placeholder">
+                  <span>🌍</span><strong>Sentinel-2 Before</strong>
+                  <small>Awaiting query</small>
+                </div>
+              </div>
+              <div class="comparison-info" id="before-s2-info">
+                <p><strong>Product:</strong> <span id="before-s2-product">--</span></p>
+                <p><strong>Source:</strong> <span class="provenance-tag tag-stac">Copernicus STAC</span></p>
+              </div>
+            </div>
+
+            <!-- S2 After -->
+            <div class="comparison-card" id="card-after-s2">
+              <div class="card-header-row">
+                <h3 style="font-size:12px; font-weight:700;">🌍 Sentinel-2 After</h3>
+                <span class="provenance-tag tag-stac" id="after-s2-date">--</span>
+              </div>
+              <div class="satellite-preview" id="after-s2-preview">
+                <img id="after-sentinel2-image" class="satellite-comparison-image" style="display:none;" />
+                <div class="satellite-placeholder" id="after-s2-placeholder">
+                  <span>🌍</span><strong>Sentinel-2 After</strong>
+                  <small>Awaiting query</small>
+                </div>
+              </div>
+              <div class="comparison-info" id="after-s2-info">
+                <p><strong>Product:</strong> <span id="after-s2-product">--</span></p>
+                <p><strong>Source:</strong> <span class="provenance-tag tag-stac">Copernicus STAC</span></p>
+              </div>
+            </div>
+          </div>
+
+          <div class="card" id="change-result-panel" style="margin-top:16px; padding:14px;">
+            <h3 style="font-size:13px; font-weight:700; margin-bottom:10px;">📊 Change Analysis</h3>
+            <div style="display:flex; justify-content:space-around; text-align:center;">
+              <div>
+                <span class="card-subtitle">Source Observation</span><br>
+                <strong id="change-area" style="font-size:14px; color:var(--text-main);">Evaluated on request</strong>
+              </div>
+              <div>
+                <span class="card-subtitle">Visual Image Difference</span><br>
+                <strong id="change-percentage" style="font-size:14px; color:var(--accent-cyan);">--</strong>
+              </div>
+              <div>
+                <span class="card-subtitle">Verification Status</span><br>
+                <strong id="change-status" style="font-size:14px; color:var(--status-warning);">AWAITING QUERY</strong>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div> <!-- /view-compare -->
+
+      <!-- ============================================== -->
+      <!-- VIEW 4: ENVIRONMENTAL RISK PREDICTIONS         -->
+      <!-- ============================================== -->
+      <div class="view-panel" id="view-risk">
+        <section class="risk-section" id="risk-section">
+          <div class="section-title-row">
+            <h3 class="section-title">
+              ⚠️ Environmental Risk Prediction <span class="provenance-tag tag-proto">PROTOTYPE MODEL</span>
+            </h3>
+            <span class="card-subtitle" id="risk-model-name">Model: Random Forest Prototype</span>
+          </div>
+
+          <div class="risk-summary-grid">
+            <div class="risk-gauge-card">
+              <div class="gauge-circle" id="risk-gauge-ring">
+                <span class="gauge-score" id="risk-score-value">--</span>
+                <span class="gauge-label">PROTOTYPE RISK SCORE</span>
+              </div>
+              <div id="risk-level-badge" class="alert-pill pill-medium">EVALUATING</div>
+              <p style="font-size:11px; color:var(--text-dim); margin-top:8px;">
+                Not a certified probabilistic forecast. Based on prototype feature inputs.
               </p>
             </div>
 
-            <!-- Test Connection Button -->
-            <div class="cdse-test-row">
-              <button id="cdse-test-btn" class="cdse-test-btn">
-                🔗 Test Connection
-              </button>
-              <span class="cdse-test-hint" id="cdse-test-hint">Tests credentials configured in backend .env</span>
+            <div class="risk-factors-grid" id="risk-factors-grid">
+              <div class="risk-factor-item">
+                <div class="factor-label">24h Rainfall</div>
+                <div class="factor-value" id="rf-rainfall">-- mm</div>
+              </div>
+              <div class="risk-factor-item">
+                <div class="factor-label">Accumulated Rain</div>
+                <div class="factor-value" id="rf-accum-rain">-- mm</div>
+              </div>
+              <div class="risk-factor-item">
+                <div class="factor-label">Temperature</div>
+                <div class="factor-value" id="rf-temperature">-- °C</div>
+              </div>
+              <div class="risk-factor-item">
+                <div class="factor-label">River Distance</div>
+                <div class="factor-value" id="rf-river-dist">-- km</div>
+              </div>
+              <div class="risk-factor-item">
+                <div class="factor-label">Terrain Elevation</div>
+                <div class="factor-value" id="rf-elevation">-- m</div>
+              </div>
+              <div class="risk-factor-item">
+                <div class="factor-label">Slope Degree</div>
+                <div class="factor-value" id="rf-slope">--°</div>
+              </div>
+              <div class="risk-factor-item">
+                <div class="factor-label">Vegetation Index (NDVI)</div>
+                <div class="factor-value" id="rf-ndvi">--</div>
+              </div>
+              <div class="risk-factor-item">
+                <div class="factor-label">Water Index (NDWI)</div>
+                <div class="factor-value" id="rf-ndwi">--</div>
+              </div>
+              <div class="risk-factor-item">
+                <div class="factor-label">Historical Frequency</div>
+                <div class="factor-value" id="rf-freq">-- events</div>
+              </div>
+              <div class="risk-factor-item">
+                <div class="factor-label">Prior Flood Extent</div>
+                <div class="factor-value" id="rf-prior-area">-- km²</div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div> <!-- /view-risk -->
+
+      <!-- ============================================== -->
+      <!-- VIEW 5: HISTORICAL FLOOD ANALYTICS             -->
+      <!-- ============================================== -->
+      <div class="view-panel" id="view-historical-floods">
+        <section class="history-section" id="history-section">
+          <div class="section-title-row">
+            <h3 class="section-title">
+              📊 Historical Flood Analytics <span class="provenance-tag tag-db">HISTORICAL DATASET</span>
+            </h3>
+            <span class="card-subtitle" id="history-source-badge">Multi-year records</span>
+          </div>
+
+          <div class="charts-row">
+            <div class="chart-card">
+              <h4>Flooded Area by Year (km²)</h4>
+              <div id="chart-area-container" class="svg-chart-container"></div>
             </div>
 
-            <!-- Download Status Notice -->
-            <div class="cdse-download-notice">
-              <strong>⛔ Satellite Data Download: Not Enabled</strong><br>
-              This task is authentication ONLY. Sentinel-1 product discovery continues using <code>"download_status": "NOT_IMPLEMENTED"</code>. No satellite files or S3 downloads are performed.
+            <div class="chart-card">
+              <h4>Rainfall by Year (mm)</h4>
+              <div id="chart-rainfall-container" class="svg-chart-container"></div>
             </div>
+          </div>
 
+          <div class="history-table-wrapper">
+            <table class="history-table">
+              <thead>
+                <tr>
+                  <th>Year</th>
+                  <th>Event Date</th>
+                  <th>Location</th>
+                  <th>Flooded Area</th>
+                  <th>Rainfall</th>
+                  <th>Duration</th>
+                  <th>Severity</th>
+                  <th>Data Source</th>
+                </tr>
+              </thead>
+              <tbody id="history-table-body">
+                <tr><td colspan="8" class="state-box">Loading historical records...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </div> <!-- /view-historical-floods -->
+
+      <!-- ============================================== -->
+      <!-- VIEW 6: DISASTER ASSESSMENT REPORT             -->
+      <!-- ============================================== -->
+      <div class="view-panel" id="view-report">
+        <div class="page-report-header">
+          <div class="s1-title-group">
+            <div class="s1-icon-badge">📑</div>
+            <div>
+              <h2 class="s1-page-title">Disaster Assessment Report</h2>
+              <p class="s1-page-subtitle">Comprehensive Hydro-meteorological &amp; Copernicus Sentinel-1 Radar Assessment Dossier.</p>
+            </div>
+          </div>
+          <div style="display:flex; align-items:center; gap:10px;">
+            <button id="page-refresh-report-btn" class="action-btn" style="padding:6px 14px; font-size:12px;">🔄 Refresh Dossier</button>
+            <button id="page-print-report-btn" class="action-btn" style="padding:6px 14px; font-size:12px;">🖨️ Print / Save PDF</button>
           </div>
         </div>
-    <!-- SENTINEL-1 DOWNLOAD CONFIRMATION MODAL -->
-    <div id="s1-download-modal" class="modal-backdrop" style="display:none;">
-      <div class="modal-window s1-download-modal-window">
-        <div class="modal-header">
-          <h3>🛰️ Sentinel-1 Product Download</h3>
-          <button id="close-s1-download-btn" class="modal-btn-close">&times;</button>
+
+        <div class="page-report-container" id="page-report-content">
+          <div class="state-box">Loading disaster assessment dossier...</div>
         </div>
-        <div class="modal-body s1-download-modal-body">
-          <p style="margin-bottom:12px; font-size:14px; font-weight:600; color:var(--text-main);">
-            Sentinel-1 product download
+      </div> <!-- /view-report -->
+
+      <!-- ============================================== -->
+      <!-- VIEW 6: DISASTER ALERT CENTER                  -->
+      <!-- ============================================== -->
+      <div class="view-panel" id="view-alerts">
+        <section class="alert-center-section" id="alert-center-section">
+          <div class="section-title-row">
+            <h3 class="section-title">
+              🔔 Disaster Alert Center <span class="provenance-tag tag-db">DATABASE ALERT</span>
+            </h3>
+            <span id="alert-count-badge" class="provenance-tag tag-proto">0 Active</span>
+          </div>
+          <div id="alerts-container" class="alerts-grid">
+            <div class="state-box">Loading alerts from database...</div>
+          </div>
+        </section>
+      </div> <!-- /view-alerts -->
+
+      <!-- ============================================== -->
+      <!-- VIEW 7: USER MANAGEMENT (ADMIN ONLY)           -->
+      <!-- ============================================== -->
+      <div class="view-panel" id="view-users" style="display:none;">
+        <div class="users-view-container">
+          <div class="section-title-row">
+            <div>
+              <h2 style="font-size:18px; color:var(--text-main); margin-bottom:4px;">
+                👥 User Management &amp; System Access Control
+              </h2>
+              <p style="font-size:12px; color:var(--text-secondary);">
+                Manage authenticated operator accounts, assign operational roles, and toggle platform access permissions.
+              </p>
+            </div>
+            <div class="provenance-legend">
+              <span class="provenance-tag tag-db">SQL SERVER: Users</span>
+              <span class="provenance-tag tag-proto">ADMIN ONLY</span>
+            </div>
+          </div>
+
+          <!-- User Stats Cards -->
+          <div class="users-stats-row">
+            <div class="users-stat-card">
+              <div class="users-stat-icon">👥</div>
+              <div>
+                <div class="users-stat-num" id="users-stat-total">--</div>
+                <div class="users-stat-title">Total Users</div>
+              </div>
+            </div>
+            <div class="users-stat-card">
+              <div class="users-stat-icon" style="background:rgba(0,240,255,0.12); border-color:rgba(0,240,255,0.3);">🛡️</div>
+              <div>
+                <div class="users-stat-num" id="users-stat-admins" style="color:var(--accent-cyan);">--</div>
+                <div class="users-stat-title">Administrators</div>
+              </div>
+            </div>
+            <div class="users-stat-card">
+              <div class="users-stat-icon" style="background:rgba(56,189,248,0.12); border-color:rgba(56,189,248,0.3);">🔬</div>
+              <div>
+                <div class="users-stat-num" id="users-stat-analysts" style="color:#38bdf8;">--</div>
+                <div class="users-stat-title">Analysts</div>
+              </div>
+            </div>
+            <div class="users-stat-card">
+              <div class="users-stat-icon" style="background:rgba(16,185,129,0.12); border-color:rgba(16,185,129,0.3);">✅</div>
+              <div>
+                <div class="users-stat-num" id="users-stat-active" style="color:#34d399;">--</div>
+                <div class="users-stat-title">Active Accounts</div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Users Table Card -->
+          <div class="users-table-card">
+            <div class="users-table-header">
+              <div class="users-table-title">
+                <span>Platform Users</span>
+                <span class="provenance-tag tag-stac" id="users-count-tag">0 Users</span>
+              </div>
+              <div class="users-table-actions">
+                <button type="button" class="btn-refresh-users" id="btn-refresh-users" title="Refresh user list">
+                  🔄 Refresh
+                </button>
+                <button type="button" class="btn-add-user" id="btn-open-add-user">
+                  ➕ Add User
+                </button>
+              </div>
+            </div>
+            <div class="users-table-wrapper">
+              <table class="users-data-table">
+                <thead>
+                  <tr>
+                    <th>User ID</th>
+                    <th>Name</th>
+                    <th>Email Address</th>
+                    <th>Role</th>
+                    <th>Status</th>
+                    <th>Created At</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="users-table-body">
+                  <tr>
+                    <td colspan="7" style="text-align:center; padding:30px; color:var(--text-secondary);">
+                      Loading users from database...
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div> <!-- /view-users -->
+
+    </div> <!-- /app-content-scroll -->
+
+  </div> <!-- /app-main-viewport -->
+
+  <!-- ============================================== -->
+  <!-- MODALS                                         -->
+  <!-- ============================================== -->
+
+  <!-- 1. Process Sentinel-1 SAR Modal -->
+  <div id="s1-sar-process-modal" class="modal-backdrop" style="display:none;">
+    <div class="modal-window sar-process-modal-window">
+      <div class="modal-header">
+        <div class="modal-header-title">
+          <span class="modal-header-icon">⚙️</span>
+          <div>
+            <h3>Prototype SAR Preprocessing</h3>
+            <span class="modal-header-subtitle">Float32 Digital-Number Conversion & Geospatial Raster Generation</span>
+          </div>
+        </div>
+        <button id="close-sar-modal-btn" class="modal-btn-close">&times;</button>
+      </div>
+      <div class="modal-body sar-process-modal-body">
+        <div class="sar-modal-product-card">
+          <div class="sar-modal-field">
+            <span class="sar-modal-label">Product ID</span>
+            <code id="sar-modal-product-id" class="sar-modal-code">--</code>
+          </div>
+          <div class="sar-modal-meta-row">
+            <div><span class="sar-modal-label">Location:</span> <strong id="sar-modal-location">--</strong></div>
+            <div><span class="sar-modal-label">Acquisition:</span> <strong id="sar-modal-date">--</strong></div>
+          </div>
+        </div>
+
+        <div class="sar-modal-pol-section">
+          <label class="sar-modal-section-label">Select Polarization:</label>
+          <div class="sar-modal-pol-selector" id="sar-modal-pol-selector">
+            <button type="button" class="sar-pol-btn active" data-pol="VV" id="sar-modal-pol-vv">VV</button>
+            <button type="button" class="sar-pol-btn" data-pol="VH" id="sar-modal-pol-vh">VH</button>
+          </div>
+          <small class="sar-modal-pol-hint">Available polarizations detected from product metadata.</small>
+        </div>
+
+        <div class="sar-modal-notice-box">
+          <span class="notice-icon">ℹ️</span>
+          <div class="notice-text">
+            This will preprocess the downloaded Sentinel-1 product to generate a geospatial raster for analysis. This step does not perform flood detection.
+          </div>
+        </div>
+
+        <div id="sar-modal-status-msg" class="sar-modal-status-msg" style="display:none;"></div>
+      </div>
+      <div class="modal-actions sar-process-modal-actions">
+        <button id="sar-modal-cancel-btn" class="modal-btn-secondary">Cancel</button>
+        <button id="sar-modal-proceed-btn" class="action-btn" style="padding:8px 22px; font-size:13px; background:var(--accent-primary);">
+          ⚙️ Process SAR
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 1.5. Prototype SAR Flood Detection Modal -->
+  <div id="s1-flood-detect-modal" class="modal-backdrop" style="display:none;">
+    <div class="modal-window sar-process-modal-window">
+      <div class="modal-header">
+        <div class="modal-header-title">
+          <span class="modal-header-icon">🌊</span>
+          <div>
+            <h3>Prototype SAR Flood Detection</h3>
+            <span class="modal-header-subtitle">Low-Backscatter Candidate Mask Generation</span>
+          </div>
+        </div>
+        <button id="close-flood-modal-btn" class="modal-btn-close">&times;</button>
+      </div>
+      <div class="modal-body sar-process-modal-body">
+        <div class="sar-modal-product-card">
+          <div class="sar-modal-field">
+            <span class="sar-modal-label">Product ID</span>
+            <code id="flood-modal-product-id" class="sar-modal-code">--</code>
+          </div>
+          <div class="sar-modal-meta-row">
+            <div><span class="sar-modal-label">Location:</span> <strong id="flood-modal-location">--</strong></div>
+            <div><span class="sar-modal-label">Acquisition:</span> <strong id="flood-modal-date">--</strong></div>
+          </div>
+        </div>
+
+        <div class="sar-modal-pol-section">
+          <label class="sar-modal-section-label">Select Polarization:</label>
+          <div class="sar-modal-pol-selector" id="flood-modal-pol-selector">
+            <button type="button" class="sar-pol-btn active" data-pol="VV" id="flood-modal-pol-vv">VV</button>
+            <button type="button" class="sar-pol-btn" data-pol="VH" id="flood-modal-pol-vh">VH</button>
+          </div>
+          <small class="sar-modal-pol-hint">Preprocessed polarization GeoTIFFs used for low-backscatter analysis.</small>
+        </div>
+
+        <div class="flood-modal-threshold-section">
+          <label class="sar-modal-section-label">Backscatter DN Threshold:</label>
+          <div class="flood-threshold-input-row">
+            <input type="number" id="flood-modal-threshold" class="flood-threshold-input" value="150" min="1" max="10000" step="1" />
+            <span class="flood-threshold-default-badge" id="flood-modal-threshold-hint">Prototype Default: 150.0 (VV) / 75.0 (VH)</span>
+          </div>
+          <small class="sar-modal-pol-hint">Valid SAR pixels with DN backscatter &le; threshold are flagged as potential flood / low-backscatter candidates.</small>
+        </div>
+
+        <div class="sar-modal-notice-box" style="border-color:rgba(245, 158, 11, 0.4); background:rgba(245, 158, 11, 0.08);">
+          <span class="notice-icon">⚠️</span>
+          <div class="notice-text" style="color:#f59e0b;">
+            <strong>Prototype Flood Detection:</strong> Detects low-backscatter candidate areas using a prototype SAR threshold. This is not a scientifically validated flood classification.
+          </div>
+        </div>
+
+        <div id="flood-modal-status-msg" class="sar-modal-status-msg" style="display:none;"></div>
+      </div>
+      <div class="modal-actions sar-process-modal-actions">
+        <button id="flood-modal-cancel-btn" class="modal-btn-secondary">Cancel</button>
+        <button id="flood-modal-proceed-btn" class="action-btn btn-flood-action" style="padding:8px 22px; font-size:13px;">
+          🌊 Run Flood Detection
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 2. Sentinel-1 Download Confirmation Modal -->
+  <div id="s1-download-modal" class="modal-backdrop" style="display:none;">
+    <div class="modal-window s1-download-modal-window">
+      <div class="modal-header">
+        <div class="modal-header-title">
+          <span class="modal-header-icon">📥</span>
+          <div>
+            <h3>Sentinel-1 Product Download</h3>
+            <span class="modal-header-subtitle">Controlled Single-Product Retrieval</span>
+          </div>
+        </div>
+        <button id="close-s1-download-btn" class="modal-btn-close">&times;</button>
+      </div>
+      <div class="modal-body s1-download-modal-body">
+        <div class="sar-modal-product-card">
+          <div class="sar-modal-field">
+            <span class="sar-modal-label">Product ID</span>
+            <code id="s1-confirm-product-id" class="sar-modal-code">--</code>
+          </div>
+          <div id="s1-confirm-size-row" class="sar-modal-meta-row" style="display:none;">
+            <span class="sar-modal-label">Estimated Size:</span>
+            <span id="s1-confirm-size-val" style="color:var(--accent-cyan); font-weight:700;">--</span>
+          </div>
+        </div>
+        <div class="sar-modal-notice-box" style="border-color:rgba(245, 158, 11, 0.3); background:rgba(245, 158, 11, 0.08);">
+          <span class="notice-icon">⚠️</span>
+          <div class="notice-text" style="color:var(--status-warning);">
+            <strong>This product may be large and will be stored locally.</strong><br>
+            <span style="font-size:11px; color:var(--text-muted);">Storage destination: <code>backend/data/sentinel1/&lt;product_id&gt;/</code></span>
+          </div>
+        </div>
+        <p style="font-weight:600; font-size:13px; color:var(--text-main);">Continue with download?</p>
+      </div>
+      <div class="modal-actions s1-download-modal-actions">
+        <button id="s1-download-cancel-btn" class="modal-btn-secondary">Cancel</button>
+        <button id="s1-download-proceed-btn" class="action-btn" style="padding:8px 20px; font-size:13px; background:var(--accent-primary);">
+          Download
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 3. Disaster Assessment Report Modal -->
+  <div id="report-modal" class="modal-backdrop" style="display:none;">
+    <div class="modal-window" style="max-width:760px; max-height:85vh;">
+      <div class="modal-header">
+        <div class="modal-header-title">
+          <span class="modal-header-icon">📑</span>
+          <div>
+            <h3>EarthWatch AI — Disaster Assessment Summary</h3>
+            <span class="modal-header-subtitle">Comprehensive Hydro-meteorological & Satellite Dossier</span>
+          </div>
+        </div>
+        <div style="display:flex; align-items:center; gap:8px;">
+          <button id="print-report-btn" class="action-btn" style="padding:4px 10px; font-size:11.5px;">🖨️ Print / Save PDF</button>
+          <button id="close-report-btn" class="modal-btn-close">&times;</button>
+        </div>
+      </div>
+      <div class="modal-body" id="report-modal-content" style="overflow-y:auto; max-height:calc(85vh - 120px);">
+        <div class="state-box">Generating comprehensive assessment dossier...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 4. Copernicus Data Space Authentication Modal -->
+  <div id="cdse-modal" class="modal-backdrop" style="display:none;">
+    <div class="modal-window cdse-modal-window">
+      <div class="modal-header">
+        <div class="modal-header-title">
+          <span class="modal-header-icon">🛰️</span>
+          <div>
+            <h3>Copernicus Data Space Access</h3>
+            <span class="modal-header-subtitle">Sentinel-1 CDSE Authentication Status</span>
+          </div>
+        </div>
+        <button id="close-cdse-btn" class="modal-btn-close">&times;</button>
+      </div>
+
+      <div class="modal-body">
+        <div class="sar-modal-notice-box">
+          <span class="notice-icon">🔒</span>
+          <div class="notice-text">
+            Copernicus credentials are stored securely on the EarthWatch AI backend environment and are never exposed to the client browser.
+          </div>
+        </div>
+
+        <div class="sar-modal-product-card">
+          <div class="card-header-row">
+            <span class="sar-modal-label">Authentication Status</span>
+            <span class="provenance-tag tag-stac">CDSE API</span>
+          </div>
+          <div id="cdse-status-display" style="margin:6px 0;">
+            <span id="cdse-status-text" style="font-size:13px; font-weight:700; color:var(--status-warning);">● Not Configured</span>
+          </div>
+          <div id="cdse-status-message" style="font-size:11.5px; color:var(--text-secondary);">
+            Copernicus Data Space credentials are not configured.
+          </div>
+        </div>
+
+        <div class="sar-modal-product-card">
+          <span class="sar-modal-label">Server Credentials</span>
+          <div style="font-size:11.5px; color:var(--text-secondary); margin-top:4px;">
+            Configured in <code>backend/.env</code>: <code>CDSE_USERNAME</code> &amp; <code>CDSE_PASSWORD</code>
+          </div>
+          <p style="font-size:10.5px; color:var(--text-dim); margin-top:6px;">
+            ✓ Secure Policy: Direct password inputs are omitted for protection.
           </p>
-          <div class="s1-confirm-detail-row">
-            <span class="s1-confirm-label">Product:</span>
-            <code id="s1-confirm-product-id" class="s1-confirm-code">--</code>
-          </div>
-          <div id="s1-confirm-size-row" class="s1-confirm-detail-row" style="display:none;">
-            <span class="s1-confirm-label">Estimated Size:</span>
-            <span id="s1-confirm-size-val" class="s1-confirm-size">--</span>
-          </div>
-          <div class="s1-confirm-warning-box">
-            <p><strong>This product may be large and will be stored locally.</strong></p>
-            <p style="margin-top:6px; font-size:12px; color:var(--text-dim);">Storage destination: <code>backend/data/sentinel1/&lt;product_id&gt;/</code></p>
-          </div>
-          <p style="margin-top:16px; font-weight:600; font-size:14px; color:var(--text-main);">
-            Continue?
-          </p>
         </div>
-        <div class="modal-actions s1-download-modal-actions">
-          <button id="s1-download-cancel-btn" class="modal-btn-secondary">Cancel</button>
-          <button id="s1-download-proceed-btn" class="action-btn" style="padding:8px 20px; font-size:13px; background:var(--accent-blue);">Download</button>
+
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-top:4px;">
+          <button id="cdse-test-btn" class="action-btn" style="padding:7px 16px;">
+            🔗 Test Connection
+          </button>
+          <span id="cdse-test-hint" style="font-size:10.5px; color:var(--text-muted);">Verifies backend environment token</span>
         </div>
       </div>
     </div>
-
+  <!-- 5. Add User Modal (Admin only) -->
+  <div id="add-user-modal" class="user-modal-overlay">
+    <div class="user-modal-card">
+      <div class="user-modal-header">
+        <h3 class="user-modal-title">➕ Create Platform User</h3>
+        <button id="close-add-user-btn" class="user-modal-close">&times;</button>
+      </div>
+      <form id="add-user-form" class="auth-form" novalidate>
+        <div id="add-user-alert" class="auth-alert-banner"></div>
+        <div class="auth-field-group">
+          <label class="auth-label" for="add-user-name">Full Name</label>
+          <input type="text" id="add-user-name" class="auth-input" placeholder="e.g. Dr. Maya Patel" required />
+          <div class="auth-error-msg" id="add-user-name-error"></div>
+        </div>
+        <div class="auth-field-group">
+          <label class="auth-label" for="add-user-email">Email Address</label>
+          <input type="email" id="add-user-email" class="auth-input" placeholder="e.g. m.patel@earthwatch.ai" required />
+          <div class="auth-error-msg" id="add-user-email-error"></div>
+        </div>
+        <div class="auth-field-group">
+          <label class="auth-label" for="add-user-password">Initial Password</label>
+          <input type="password" id="add-user-password" class="auth-input" placeholder="Minimum 8 characters" required />
+          <div class="auth-error-msg" id="add-user-password-error"></div>
+        </div>
+        <div class="auth-field-group">
+          <label class="auth-label" for="add-user-role">Assigned Platform Role</label>
+          <select id="add-user-role" class="auth-input" style="padding-left:14px;">
+            <option value="ANALYST">ANALYST — Core Intelligence, Satellite & Flood Analysis</option>
+            <option value="ADMIN">ADMIN — Full Platform, User Management & System Control</option>
+          </select>
+        </div>
+        <div style="display:flex; justify-content:flex-end; gap:10px; margin-top:12px;">
+          <button type="button" id="cancel-add-user-btn" class="btn-refresh-users">Cancel</button>
+          <button type="submit" id="submit-add-user-btn" class="btn-add-user">Create User</button>
+        </div>
+      </form>
+    </div>
   </div>
-`;
 
+</div>
+`;
 // ======================================================
 // DOM REFERENCES
 // ======================================================
@@ -1169,6 +2249,29 @@ const sysStatusStac = document.querySelector<HTMLElement>("#sys-status-stac");
 const sysStatusRisk = document.querySelector<HTMLElement>("#sys-status-risk");
 const sysStatusReport = document.querySelector<HTMLElement>("#sys-status-report");
 
+// Location Observation section DOM
+const locObsSelect = document.querySelector<HTMLSelectElement>("#loc-obs-select");
+const locObsCoords = document.querySelector<HTMLElement>("#loc-obs-coords");
+const locObsMeta = document.querySelector<HTMLElement>("#loc-obs-meta");
+const locObsIdBadge = document.querySelector<HTMLElement>("#loc-obs-id-badge");
+const locObsSatBody = document.querySelector<HTMLElement>("#loc-obs-sat-body");
+const locObsFloodBody = document.querySelector<HTMLElement>("#loc-obs-flood-body");
+const locObsRiskBody = document.querySelector<HTMLElement>("#loc-obs-risk-body");
+const locObsAlertsBody = document.querySelector<HTMLElement>("#loc-obs-alerts-body");
+const locObsStatusBody = document.querySelector<HTMLElement>("#loc-obs-status-body");
+
+// Flood Detection section DOM
+const floodCtrlLocation = document.querySelector<HTMLElement>("#flood-ctrl-location");
+const floodCtrlProductId = document.querySelector<HTMLElement>("#flood-ctrl-product-id");
+const floodCtrlPreprocessBtn = document.querySelector<HTMLButtonElement>("#flood-ctrl-preprocess-btn");
+const floodCtrlDetectBtn = document.querySelector<HTMLButtonElement>("#flood-ctrl-detect-btn");
+const floodCtrlReportBtn = document.querySelector<HTMLButtonElement>("#flood-ctrl-report-btn");
+
+// In-Page Report section DOM
+const pageReportContent = document.querySelector<HTMLElement>("#page-report-content");
+const pagePrintReportBtn = document.querySelector<HTMLButtonElement>("#page-print-report-btn");
+const pageRefreshReportBtn = document.querySelector<HTMLButtonElement>("#page-refresh-report-btn");
+
 // ======================================================
 // LEAFLET MAP INITIALIZATION
 // ======================================================
@@ -1256,9 +2359,13 @@ async function fetchDbAlerts(): Promise<AlertRecord[]> {
   return response.data?.alerts || [];
 }
 
-async function fetchReportSummary(locationId: number): Promise<ReportSummary> {
+async function fetchReportSummary(locationId: number, productId?: string | null): Promise<ReportSummary> {
+  const params: Record<string, any> = { location_id: locationId };
+  if (productId) {
+    params.product_id = productId;
+  }
   const response = await axios.get(`${BACKEND_URL}/reports/summary`, {
-    params: { location_id: locationId },
+    params,
   });
   return response.data;
 }
@@ -1360,6 +2467,74 @@ async function requestSentinel1Download(
   return response.data;
 }
 
+async function fetchSarProductStatus(productId: string): Promise<SarStatusResponse> {
+  const response = await axios.get<SarStatusResponse>(
+    `${BACKEND_URL}/sar/status`,
+    {
+      params: { product_id: productId },
+    }
+  );
+  return response.data;
+}
+
+async function requestSarPreprocessing(
+  productId: string,
+  polarization: string
+): Promise<SarPreprocessResponse> {
+  const response = await axios.post<SarPreprocessResponse>(
+    `${BACKEND_URL}/sar/preprocess`,
+    {
+      product_id: productId,
+      polarization: polarization,
+    },
+    {
+      timeout: 120000,
+      validateStatus: (status) => status < 500,
+    }
+  );
+  return response.data;
+}
+
+async function fetchFloodDetectionStatus(
+  productId: string,
+  polarization?: string
+): Promise<FloodDetectionStatusResponse> {
+  const params: Record<string, string> = { product_id: productId };
+  if (polarization) params.polarization = polarization;
+  const response = await axios.get<FloodDetectionStatusResponse>(
+    `${BACKEND_URL}/flood/detection/status`,
+    {
+      params,
+      timeout: 10000,
+      validateStatus: (status) => status < 500,
+    }
+  );
+  return response.data;
+}
+
+async function requestFloodDetection(
+  productId: string,
+  polarization: string,
+  threshold?: number
+): Promise<FloodDetectionResponse> {
+  const payload: Record<string, any> = {
+    product_id: productId,
+    polarization: polarization,
+  };
+  if (threshold !== undefined && !isNaN(threshold)) {
+    payload.threshold = threshold;
+  }
+  const response = await axios.post<FloodDetectionResponse>(
+    `${BACKEND_URL}/flood/detect`,
+    payload,
+    {
+      timeout: 120000,
+      validateStatus: (status) => status < 500,
+    }
+  );
+  return response.data;
+}
+
 // ======================================================
 // WEATHER & AIR QUALITY (OPENWEATHER API)
 // ======================================================
@@ -1423,7 +2598,7 @@ function updateInsightCard(temperature: number, aqi: number | null | undefined, 
   if (recommendationEl) {
     if (riskLevel === "HIGH" || riskLevel === "VERY HIGH") {
       recommendationEl.textContent =
-        "High flood probability indicated. Prioritize surface runoff drainage inspections and river basin telemetry.";
+        "Elevated prototype risk indicated. Prioritize surface runoff drainage inspections and river basin telemetry.";
     } else {
       recommendationEl.textContent =
         "Normal operational baseline. Continue routine satellite pass acquisition and atmospheric monitoring.";
@@ -1595,7 +2770,7 @@ function renderAlerts(alerts: AlertRecord[], locId: number) {
     alertCountBadge.textContent = "0 Active";
     alertsContainer.innerHTML = `
       <div class="state-box" style="grid-column: 1 / -1;">
-        No alerts for this location.
+        No active alerts for this location.
       </div>
     `;
     return;
@@ -1719,8 +2894,26 @@ async function selectMonitoredLocation(locationIdentifier: number | string) {
   selectedLatitude = activeLoc.latitude;
   selectedLongitude = activeLoc.longitude;
 
+  // Clear previous product selection to prevent stale location data bleed
+  selectedSentinel1Product = null;
+  selectedSentinel1SarStatus = null;
+  selectedSentinel1FloodStatus = null;
+  renderProductDetails(null);
+  renderGlobalProcessingResults(null);
+  updateProcessingTimeline({ badge: "IDLE" });
+  updateWorkflowStepper({
+    discoverDone: true,
+    downloadDone: false,
+    preprocessDone: false,
+    floodDone: false,
+    reportDone: false,
+  });
+
   if (dbLocationSelect) {
     dbLocationSelect.value = String(activeLoc.location_id);
+  }
+  if (locObsSelect) {
+    locObsSelect.value = String(activeLoc.location_id);
   }
   if (comparisonLocationSelect) {
     comparisonLocationSelect.value = activeLoc.location_name;
@@ -1735,8 +2928,16 @@ async function selectMonitoredLocation(locationIdentifier: number | string) {
   metaCoords.textContent = `${activeLoc.latitude.toFixed(4)}° N, ${activeLoc.longitude.toFixed(4)}° E`;
   mapActiveCoords.textContent = `${activeLoc.latitude.toFixed(4)}° N, ${activeLoc.longitude.toFixed(4)}° E`;
 
-  map.flyTo([activeLoc.latitude, activeLoc.longitude], 12, { duration: 1.2 });
-  renderLocationPins(dbLocations, activeLoc.location_id);
+  try {
+    if (activeView === "satellite") {
+      map.flyTo([activeLoc.latitude, activeLoc.longitude], 12, { duration: 1.2 });
+      renderLocationPins(dbLocations, activeLoc.location_id);
+    } else {
+      map.setView([activeLoc.latitude, activeLoc.longitude], 12);
+    }
+  } catch (err) {
+    console.warn("Map view update skipped (container hidden):", err);
+  }
 
   // 2. Satellite Observations (Filtered by LocationID)
   const locObservations = allObservations.filter(
@@ -1896,8 +3097,13 @@ async function selectMonitoredLocation(locationIdentifier: number | string) {
   // 8. Copernicus SAR Discovery (existing query)
   loadCopernicusSarAsset(activeLoc.location_name);
 
-  // 9b. Sentinel-1 Product Discovery (new endpoint by location_id)
-  loadSentinel1Discovery(activeLoc.location_id, activeLoc.location_name);
+  // 9b. Sentinel-1 Product Discovery (only fetch if currently on Satellite view)
+  if (activeView === "satellite") {
+    lastLoadedSatelliteLocationId = activeLoc.location_id;
+    loadSentinel1Discovery(activeLoc.location_id, activeLoc.location_name);
+  } else {
+    lastLoadedSatelliteLocationId = null;
+  }
 
   // 9. Live Weather & Atmospheric Telemetry
   try {
@@ -1932,6 +3138,10 @@ async function selectMonitoredLocation(locationIdentifier: number | string) {
     airQualityElement.textContent = "--";
     updateInsightCard(28, null, currentRiskLevel);
   }
+
+  updateLocationObservationView();
+  updateFloodDetectionView();
+  renderCurrentView();
 }
 
 async function loadCopernicusSarAsset(locationName: string) {
@@ -1960,9 +3170,1306 @@ async function loadCopernicusSarAsset(locationName: string) {
   }
 }
 
+
+// Topbar & Navigation DOM
+const topStatObs = document.querySelector<HTMLElement>("#top-stat-obs");
+const topStatFloods = document.querySelector<HTMLElement>("#top-stat-floods");
+const topStatRisk = document.querySelector<HTMLElement>("#top-stat-risk");
+const topStatAlerts = document.querySelector<HTMLElement>("#top-stat-alerts");
+const sidebarAlertBadge = document.querySelector<HTMLElement>("#sidebar-alert-badge");
+
+// Process SAR Modal DOM
+const closeSarModalBtn = document.querySelector<HTMLButtonElement>("#close-sar-modal-btn");
+const sarModalCancelBtn = document.querySelector<HTMLButtonElement>("#sar-modal-cancel-btn");
+const closeFloodModalBtn = document.querySelector<HTMLButtonElement>("#close-flood-modal-btn");
+const floodModalCancelBtn = document.querySelector<HTMLButtonElement>("#flood-modal-cancel-btn");
+
 // ======================================================
-// SENTINEL-1 PRODUCT DISCOVERY PANEL
+// SENTINEL-1 PRODUCT DISCOVERY & SAR PROCESSING
 // ======================================================
+
+let currentDiscoveredProducts: Sentinel1Product[] = [];
+let lastLoadedSatelliteLocationId: number | null = null;
+let selectedSentinel1Product: Sentinel1Product | null = null;
+let selectedSentinel1SarStatus: SarStatusResponse | null = null;
+let selectedSentinel1FloodStatus: FloodDetectionStatusResponse | null = null;
+let selectedModalPol: string = "VV";
+let selectedFloodModalPol: string = "VV";
+let currentResultsTab: "sar" | "flood" = "sar";
+let s1FloodLayer: L.Layer | null = null;
+
+function updateTopStatistics() {
+  if (topStatObs) topStatObs.textContent = String(allObservations.length);
+  if (topStatFloods) topStatFloods.textContent = String(allFloodDetections.length);
+  if (topStatAlerts) {
+    const activeCount = allAlerts.filter(a => !a.is_resolved).length;
+    topStatAlerts.textContent = String(activeCount);
+    if (sidebarAlertBadge) sidebarAlertBadge.textContent = String(activeCount);
+  }
+  if (topStatRisk) {
+    const curRisk = allRiskPredictions.find(r => r.location_id === selectedLocationId);
+    if (curRisk && curRisk.risk_score !== null) {
+      topStatRisk.textContent = `${curRisk.risk_score.toFixed(2)}`;
+    } else {
+      topStatRisk.textContent = "0.64";
+    }
+  }
+}
+
+function updateLocationObservationView() {
+  const activeLoc = dbLocations.find((l) => l.location_id === selectedLocationId) || dbLocations[0];
+  if (!activeLoc) return;
+
+  if (locObsSelect && locObsSelect.value !== String(activeLoc.location_id)) {
+    locObsSelect.value = String(activeLoc.location_id);
+  }
+  if (locObsMeta) locObsMeta.textContent = `${activeLoc.district}, ${activeLoc.state}`;
+  if (locObsIdBadge) locObsIdBadge.textContent = `LOC-${activeLoc.location_id}`;
+  if (locObsCoords) locObsCoords.textContent = `${activeLoc.latitude.toFixed(4)}° N, ${activeLoc.longitude.toFixed(4)}° E`;
+
+  // 1. Satellite Observations Card
+  if (locObsSatBody) {
+    const locObservations = allObservations.filter((s) => s.location_id === activeLoc.location_id);
+    if (locObservations.length > 0) {
+      locObsSatBody.innerHTML = `
+        <div style="display:flex; flex-direction:column; gap:10px;">
+          ${locObservations.map((obs) => `
+            <div class="loc-obs-metric" style="gap:6px;">
+              <div style="display:flex; justify-content:space-between; align-items:center;">
+                <strong style="color:var(--accent-cyan); font-size:13px;">${obs.satellite} • ${obs.sensor}</strong>
+                <span class="provenance-tag tag-db">${obs.data_source}</span>
+              </div>
+              <div style="font-size:11.5px; color:var(--text-secondary);">
+                <span>Acquired: <strong>${obs.acquisition_date}</strong></span>
+                ${obs.cloud_cover !== null ? `<span style="margin-left:8px;">Cloud Cover: <strong>${obs.cloud_cover}%</strong></span>` : ""}
+              </div>
+              <div style="font-size:11px; color:var(--text-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+                Product: <code>${obs.product_id}</code>
+              </div>
+            </div>
+          `).join("")}
+        </div>
+      `;
+    } else {
+      locObsSatBody.innerHTML = `
+        <div class="state-box">
+          No satellite observations available for this location.
+        </div>
+      `;
+    }
+  }
+
+  // 2. Flood Information Card
+  if (locObsFloodBody) {
+    const locFloods = allFloodDetections.filter((f) => f.location_id === activeLoc.location_id);
+    const locRegions = allFloodRegions.filter((r) => r.location_id === activeLoc.location_id);
+    if (locFloods.length > 0) {
+      locObsFloodBody.innerHTML = `
+        <div style="display:flex; flex-direction:column; gap:10px;">
+          ${locFloods.map((fl) => `
+            <div class="loc-obs-metric" style="gap:6px;">
+              <div style="display:flex; justify-content:space-between; align-items:center;">
+                <span style="font-weight:700; color:var(--text-main); font-size:13px;">${fl.satellite} ${fl.sensor}</span>
+                <span class="provenance-tag ${fl.status === "ACTIVE" ? "tag-live" : "tag-db"}">${fl.status}</span>
+              </div>
+              <div class="loc-obs-metric-grid" style="margin-top:4px;">
+                <div>
+                  <span class="card-subtitle">Inundation Area</span>
+                  <div style="font-size:14px; font-weight:700; color:var(--accent-cyan);">${fl.flooded_area_km2 ?? 0} km²</div>
+                </div>
+                <div>
+                  <span class="card-subtitle">Flood Ratio</span>
+                  <div style="font-size:14px; font-weight:700; color:var(--status-warning);">${fl.flood_percentage ?? 0}%</div>
+                </div>
+                <div>
+                  <span class="card-subtitle">Confidence</span>
+                  <div style="font-size:13px; font-weight:600;">${fl.confidence !== null ? `${Math.round(fl.confidence * 100)}%` : "N/A"}</div>
+                </div>
+                <div>
+                  <span class="card-subtitle">Detection Method</span>
+                  <div style="font-size:11.5px; color:var(--text-muted);">${fl.detection_method}</div>
+                </div>
+              </div>
+              <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">
+                Detection Date: ${fl.detection_date} • Source: ${fl.source}
+              </div>
+            </div>
+          `).join("")}
+          ${locRegions.length > 0 ? `
+            <div style="margin-top:4px; font-size:11.5px; color:var(--text-muted);">
+              <strong>Mapped Sub-regions (${locRegions.length}):</strong>
+              <div style="display:flex; flex-wrap:wrap; gap:6px; margin-top:6px;">
+                ${locRegions.map((r) => `<span class="provenance-tag tag-db">${r.region_name} (${r.affected_area_km2 ?? 0} km² · ${r.severity})</span>`).join("")}
+              </div>
+            </div>
+          ` : ""}
+        </div>
+      `;
+    } else {
+      locObsFloodBody.innerHTML = `
+        <div class="state-box">
+          No flood detection data available for this location.
+        </div>
+      `;
+    }
+  }
+
+  // 3. Risk Information Card
+  if (locObsRiskBody) {
+    const locRisks = allRiskPredictions.filter((r) => r.location_id === activeLoc.location_id);
+    if (locRisks.length > 0) {
+      const risk = locRisks[0];
+      const scorePct = risk.risk_score !== null ? Math.round(risk.risk_score * 100) : null;
+      const pillClass = risk.risk_level === "HIGH" || risk.risk_level === "VERY HIGH" ? "pill-high" : risk.risk_level === "MEDIUM" ? "pill-medium" : "pill-low";
+      locObsRiskBody.innerHTML = `
+        <div style="display:flex; flex-direction:column; gap:10px;">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <div>
+              <span class="alert-pill ${pillClass}">${risk.risk_level} RISK</span>
+              <strong style="margin-left:8px; font-size:15px; color:var(--text-main);">${scorePct !== null ? `${scorePct}%` : "--"}</strong>
+            </div>
+            <span class="provenance-tag tag-proto">${risk.model_name}</span>
+          </div>
+          <div class="loc-obs-metric-grid" style="font-size:11.5px;">
+            <div class="loc-obs-metric">
+              <span class="card-subtitle">24h Rainfall</span>
+              <strong>${risk.rainfall_mm !== null ? `${risk.rainfall_mm} mm` : "N/A"}</strong>
+            </div>
+            <div class="loc-obs-metric">
+              <span class="card-subtitle">Accumulated Rain</span>
+              <strong>${risk.accumulated_rainfall_mm !== null ? `${risk.accumulated_rainfall_mm} mm` : "N/A"}</strong>
+            </div>
+            <div class="loc-obs-metric">
+              <span class="card-subtitle">River Distance</span>
+              <strong>${risk.river_distance_km !== null ? `${risk.river_distance_km} km` : "N/A"}</strong>
+            </div>
+            <div class="loc-obs-metric">
+              <span class="card-subtitle">Terrain Elevation</span>
+              <strong>${risk.elevation_m !== null ? `${risk.elevation_m} m` : "N/A"}</strong>
+            </div>
+            <div class="loc-obs-metric">
+              <span class="card-subtitle">Slope</span>
+              <strong>${risk.slope_degree !== null ? `${risk.slope_degree}°` : "N/A"}</strong>
+            </div>
+            <div class="loc-obs-metric">
+              <span class="card-subtitle">Prior Flooded Area</span>
+              <strong>${risk.previous_flooded_area_km2 !== null ? `${risk.previous_flooded_area_km2} km²` : "N/A"}</strong>
+            </div>
+          </div>
+          <div style="font-size:11px; color:var(--text-dim);">
+            Prediction Date: ${risk.prediction_date}
+          </div>
+        </div>
+      `;
+    } else {
+      locObsRiskBody.innerHTML = `
+        <div class="state-box">
+          No risk prediction data available for this location.
+        </div>
+      `;
+    }
+  }
+
+  // 4. Alerts Card
+  if (locObsAlertsBody) {
+    const locAlerts = allAlerts.filter((a) => a.location_id === activeLoc.location_id);
+    if (locAlerts.length > 0) {
+      locObsAlertsBody.innerHTML = `
+        <div style="display:flex; flex-direction:column; gap:8px;">
+          ${locAlerts.map((a) => {
+            const pillClass = a.alert_level === "HIGH" || a.alert_level === "CRITICAL" ? "pill-high" : a.alert_level === "MEDIUM" ? "pill-medium" : "pill-low";
+            return `
+              <div class="loc-obs-metric" style="gap:4px;">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                  <span class="alert-pill ${pillClass}">${a.alert_level} • ${a.alert_type}</span>
+                  <span style="font-size:11px; color:var(--text-dim);">${a.alert_date}</span>
+                </div>
+                <p style="font-size:12px; color:var(--text-main); margin:3px 0 0;">${a.alert_message}</p>
+                <div style="font-size:10.5px; color:var(--text-muted);">
+                  Status: <strong>${a.is_resolved ? "Resolved" : "Active"}</strong>
+                </div>
+              </div>
+            `;
+          }).join("")}
+        </div>
+      `;
+    } else {
+      locObsAlertsBody.innerHTML = `
+        <div class="state-box">
+          No active alerts for this location.
+        </div>
+      `;
+    }
+  }
+
+  // 5. Status & Telemetry Card
+  if (locObsStatusBody) {
+    locObsStatusBody.innerHTML = `
+      <div class="loc-obs-metric-grid" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));">
+        <div class="loc-obs-metric">
+          <span class="card-subtitle">Coordinates</span>
+          <strong style="font-size:12.5px; color:var(--text-main);">${activeLoc.latitude.toFixed(4)}° N, ${activeLoc.longitude.toFixed(4)}° E</strong>
+        </div>
+        <div class="loc-obs-metric">
+          <span class="card-subtitle">Temperature</span>
+          <strong style="font-size:12.5px; color:var(--accent-cyan);">${temperatureElement.textContent || "--"}</strong>
+        </div>
+        <div class="loc-obs-metric">
+          <span class="card-subtitle">Weather Condition</span>
+          <strong style="font-size:12.5px; color:var(--text-main);">${conditionElement.textContent || "--"}</strong>
+        </div>
+        <div class="loc-obs-metric">
+          <span class="card-subtitle">Precipitation Depth</span>
+          <strong style="font-size:12.5px; color:var(--text-main);">${rainfallElement.textContent || "--"}</strong>
+        </div>
+        <div class="loc-obs-metric">
+          <span class="card-subtitle">Air Quality</span>
+          <strong style="font-size:12.5px; color:var(--text-main);">${airQualityElement.textContent || "--"}</strong>
+        </div>
+        <div class="loc-obs-metric">
+          <span class="card-subtitle">Telemetry State</span>
+          <strong style="font-size:12.5px; color:#10b981;">● Connected / Live</strong>
+        </div>
+      </div>
+    `;
+  }
+}
+
+function updateFloodDetectionView() {
+  if (floodCtrlLocation) {
+    floodCtrlLocation.textContent = `${selectedLocationName} (ID: ${selectedLocationId})`;
+  }
+  if (floodCtrlProductId) {
+    if (selectedSentinel1Product && selectedSentinel1Product.product_id) {
+      floodCtrlProductId.textContent = selectedSentinel1Product.product_id;
+      floodCtrlProductId.title = selectedSentinel1Product.product_id;
+    } else {
+      floodCtrlProductId.textContent = "No product selected — choose a Sentinel-1 product from the Satellite page";
+      floodCtrlProductId.title = "";
+    }
+  }
+
+  const emptyResultsState = document.querySelector<HTMLElement>("#empty-results-state");
+  const activeResultsContent = document.querySelector<HTMLElement>("#active-results-content");
+  if (!selectedSentinel1Product) {
+    if (emptyResultsState) emptyResultsState.style.display = "block";
+    if (activeResultsContent) activeResultsContent.style.display = "none";
+  } else {
+    if (emptyResultsState) emptyResultsState.style.display = "none";
+    if (activeResultsContent) activeResultsContent.style.display = "block";
+  }
+}
+
+function updateWorkflowStepper(state: {
+  discoverDone?: boolean;
+  downloadActive?: boolean;
+  downloadDone?: boolean;
+  preprocessActive?: boolean;
+  preprocessDone?: boolean;
+  floodActive?: boolean;
+  floodDone?: boolean;
+  reportActive?: boolean;
+  reportDone?: boolean;
+}) {
+  const step1 = document.querySelector<HTMLElement>("#step-1-discover");
+  const step2 = document.querySelector<HTMLElement>("#step-2-download");
+  const step3 = document.querySelector<HTMLElement>("#step-3-preprocess");
+  const step4 = document.querySelector<HTMLElement>("#step-4-detection");
+  const step5 = document.querySelector<HTMLElement>("#step-5-report");
+  const line1 = document.querySelector<HTMLElement>("#stepper-line-1");
+  const line2 = document.querySelector<HTMLElement>("#stepper-line-2");
+  const line3 = document.querySelector<HTMLElement>("#stepper-line-3");
+  const line4 = document.querySelector<HTMLElement>("#stepper-line-4");
+  const step4Desc = document.querySelector<HTMLElement>("#step-4-desc");
+  const step5Desc = document.querySelector<HTMLElement>("#step-5-desc");
+
+  if (step1) {
+    step1.className = state.discoverDone ? "stepper-step completed" : "stepper-step active";
+  }
+  if (line1) {
+    line1.className = state.discoverDone ? "stepper-line completed" : "stepper-line";
+  }
+
+  if (step2) {
+    if (state.downloadDone) {
+      step2.className = "stepper-step completed";
+      if (line2) line2.className = "stepper-line completed";
+    } else if (state.downloadActive) {
+      step2.className = "stepper-step active";
+      if (line2) line2.className = "stepper-line active";
+    } else {
+      step2.className = "stepper-step pending";
+      if (line2) line2.className = "stepper-line";
+    }
+  }
+
+  if (step3) {
+    if (state.preprocessDone) {
+      step3.className = "stepper-step completed";
+      if (line3) line3.className = "stepper-line completed";
+    } else if (state.preprocessActive) {
+      step3.className = "stepper-step active";
+      if (line3) line3.className = "stepper-line active";
+    } else {
+      step3.className = "stepper-step pending";
+      if (line3) line3.className = "stepper-line";
+    }
+  }
+
+  if (step4) {
+    if (state.floodDone) {
+      step4.className = "stepper-step completed";
+      if (line4) line4.className = "stepper-line completed";
+      if (step4Desc) step4Desc.textContent = "✓ Detected";
+    } else if (state.floodActive || state.preprocessDone) {
+      step4.className = "stepper-step active";
+      if (line4) line4.className = "stepper-line active";
+      if (step4Desc) step4Desc.textContent = "Ready";
+    } else {
+      step4.className = "stepper-step pending";
+      if (line4) line4.className = "stepper-line";
+      if (step4Desc) step4Desc.textContent = "Coming Soon";
+    }
+  }
+
+  if (step5) {
+    if (state.reportDone) {
+      step5.className = "stepper-step completed";
+      if (step5Desc) step5Desc.textContent = "✓ Completed";
+    } else if (state.reportActive || state.floodDone) {
+      step5.className = "stepper-step active";
+      if (step5Desc) step5Desc.textContent = "Ready";
+    } else {
+      step5.className = "stepper-step pending";
+      if (step5Desc) step5Desc.textContent = "Coming Soon";
+    }
+  }
+}
+
+function updateProcessingTimeline(state: {
+  validated?: boolean;
+  downloading?: boolean;
+  downloaded?: boolean;
+  preprocessing?: boolean;
+  preprocessed?: boolean;
+  floodReady?: boolean;
+  floodDetecting?: boolean;
+  floodDetected?: boolean;
+  reportReady?: boolean;
+  reportGenerated?: boolean;
+  badge?: string;
+}) {
+  const nodeValidate = document.querySelector<HTMLElement>("#tl-node-validate");
+  const nodeDownload = document.querySelector<HTMLElement>("#tl-node-download");
+  const nodePreprocess = document.querySelector<HTMLElement>("#tl-node-preprocess");
+  const nodeFlood = document.querySelector<HTMLElement>("#tl-node-flood");
+  const nodeReport = document.querySelector<HTMLElement>("#tl-node-report");
+  const subDownload = document.querySelector<HTMLElement>("#tl-sub-download");
+  const subPreprocess = document.querySelector<HTMLElement>("#tl-sub-preprocess");
+  const subFlood = document.querySelector<HTMLElement>("#tl-sub-flood");
+  const subReport = document.querySelector<HTMLElement>("#tl-sub-report");
+  const liveBadge = document.querySelector<HTMLElement>("#timeline-live-badge");
+  const conn1 = document.querySelector<HTMLElement>("#tl-conn-1");
+  const conn2 = document.querySelector<HTMLElement>("#tl-conn-2");
+  const conn3 = document.querySelector<HTMLElement>("#tl-conn-3");
+  const conn4 = document.querySelector<HTMLElement>("#tl-conn-4");
+
+  if (nodeValidate) {
+    nodeValidate.className = state.validated ? "timeline-node completed" : "timeline-node pending";
+    const icon = nodeValidate.querySelector<HTMLElement>(".node-icon-circle");
+    if (icon) icon.textContent = state.validated ? "✓" : "1";
+  }
+
+  if (nodeDownload) {
+    const icon = nodeDownload.querySelector<HTMLElement>(".node-icon-circle");
+    if (state.downloaded) {
+      nodeDownload.className = "timeline-node completed";
+      if (subDownload) subDownload.textContent = "Downloaded";
+      if (icon) icon.textContent = "✓";
+      if (conn1) conn1.className = "timeline-connector completed";
+    } else if (state.downloading) {
+      nodeDownload.className = "timeline-node in-progress";
+      if (subDownload) subDownload.textContent = "Downloading...";
+      if (icon) icon.textContent = "2";
+      if (conn1) conn1.className = "timeline-connector active";
+    } else {
+      nodeDownload.className = "timeline-node pending";
+      if (subDownload) subDownload.textContent = "Awaiting download";
+      if (icon) icon.textContent = "2";
+      if (conn1) conn1.className = "timeline-connector";
+    }
+  }
+
+  if (nodePreprocess) {
+    const icon = nodePreprocess.querySelector<HTMLElement>(".node-icon-circle");
+    if (state.preprocessed) {
+      nodePreprocess.className = "timeline-node completed";
+      if (subPreprocess) subPreprocess.textContent = "Preprocessed";
+      if (icon) icon.textContent = "✓";
+      if (conn2) conn2.className = "timeline-connector completed";
+    } else if (state.preprocessing) {
+      nodePreprocess.className = "timeline-node in-progress";
+      if (subPreprocess) subPreprocess.textContent = "Processing SAR...";
+      if (icon) icon.textContent = "3";
+      if (conn2) conn2.className = "timeline-connector active";
+    } else {
+      nodePreprocess.className = "timeline-node pending";
+      if (subPreprocess) subPreprocess.textContent = "Awaiting processing";
+      if (icon) icon.textContent = "3";
+      if (conn2) conn2.className = "timeline-connector";
+    }
+  }
+
+  if (nodeFlood) {
+    const icon = nodeFlood.querySelector<HTMLElement>(".node-icon-circle");
+    if (state.floodDetected) {
+      nodeFlood.className = "timeline-node completed";
+      if (subFlood) subFlood.textContent = "Candidate Mask Ready";
+      if (icon) icon.textContent = "✓";
+      if (conn3) conn3.className = "timeline-connector completed";
+      if (conn4) conn4.className = "timeline-connector active";
+    } else if (state.floodDetecting) {
+      nodeFlood.className = "timeline-node in-progress";
+      if (subFlood) subFlood.textContent = "Detecting Floods...";
+      if (icon) icon.textContent = "4";
+      if (conn3) conn3.className = "timeline-connector active";
+    } else if (state.preprocessed || state.floodReady) {
+      nodeFlood.className = "timeline-node pending";
+      if (subFlood) subFlood.textContent = "Ready for detection";
+      if (icon) icon.textContent = "4";
+      if (conn3) conn3.className = "timeline-connector completed";
+    } else {
+      nodeFlood.className = "timeline-node coming-soon";
+      if (subFlood) subFlood.textContent = "Awaiting preprocess";
+      if (icon) icon.textContent = "○";
+      if (conn3) conn3.className = "timeline-connector";
+    }
+  }
+
+  if (nodeReport) {
+    const icon = nodeReport.querySelector<HTMLElement>(".node-icon-circle");
+    if (state.reportGenerated) {
+      nodeReport.className = "timeline-node completed";
+      if (subReport) subReport.textContent = "Report Ready";
+      if (icon) icon.textContent = "✓";
+      if (conn4) conn4.className = "timeline-connector completed";
+    } else if (state.reportReady || state.floodDetected) {
+      nodeReport.className = "timeline-node in-progress";
+      if (subReport) subReport.textContent = "Ready for Report";
+      if (icon) icon.textContent = "5";
+      if (conn4) conn4.className = "timeline-connector active";
+    } else {
+      nodeReport.className = "timeline-node coming-soon";
+      if (subReport) subReport.textContent = "Awaiting Analysis";
+      if (icon) icon.textContent = "○";
+      if (conn4) conn4.className = "timeline-connector";
+    }
+  }
+
+  if (liveBadge) {
+    liveBadge.textContent = state.badge || (
+      state.floodDetected ? "FLOOD DETECTED" :
+      state.preprocessed ? "PREPROCESSED" :
+      state.downloaded ? "DOWNLOADED" :
+      state.downloading ? "DOWNLOADING" : "READY"
+    );
+  }
+}
+
+function renderProductDetails(
+  p: Sentinel1Product | null,
+  sarStatus?: SarStatusResponse | null,
+  floodStatus?: FloodDetectionStatusResponse | null
+) {
+  const emptyEl = document.querySelector<HTMLElement>("#empty-details-state");
+  const activeEl = document.querySelector<HTMLElement>("#active-details-content");
+  if (!emptyEl || !activeEl) return;
+
+  if (!p) {
+    emptyEl.style.display = "flex";
+    activeEl.style.display = "none";
+    return;
+  }
+
+  emptyEl.style.display = "none";
+  activeEl.style.display = "block";
+
+  const acqDate = p.acquisition_date ? new Date(p.acquisition_date).toUTCString() : "--";
+  const isDownloaded = sarStatus?.is_downloaded || false;
+  const processedPols = sarStatus?.processed_polarizations || [];
+  const isPreprocessed = processedPols.length > 0;
+  const floodPols = floodStatus?.detected_polarizations || [];
+  const hasFlood = floodPols.length > 0;
+  const bboxStr = p.bbox ? p.bbox.map(v => v.toFixed(3)).join(", ") : "--";
+
+  activeEl.innerHTML = `
+    <div class="details-content-grid">
+      <div class="details-hero-box">
+        <div style="font-size:9.5px; color:var(--text-muted); text-transform:uppercase; margin-bottom:2px;">Selected Product ID</div>
+        <div class="details-prod-id" title="${p.product_id || ''}">${p.product_id || '--'}</div>
+      </div>
+
+      <table class="details-attr-table">
+        <tbody>
+          <tr>
+            <td class="attr-key">Acquisition Date</td>
+            <td class="attr-val">${acqDate}</td>
+          </tr>
+          <tr>
+            <td class="attr-key">Sensor / Mode</td>
+            <td class="attr-val">${p.sensor || "C-SAR"} (${p.product_type || "GRD"})</td>
+          </tr>
+          <tr>
+            <td class="attr-key">Polarization</td>
+            <td class="attr-val" style="color:var(--accent-cyan);">${p.polarization || "VV + VH"}</td>
+          </tr>
+          <tr>
+            <td class="attr-key">Platform</td>
+            <td class="attr-val">${p.platform || "Sentinel-1"}</td>
+          </tr>
+          <tr>
+            <td class="attr-key">Orbit Direction</td>
+            <td class="attr-val">${p.orbit_direction || "DESCENDING"}</td>
+          </tr>
+          <tr>
+            <td class="attr-key">Relative Orbit</td>
+            <td class="attr-val">${p.relative_orbit ?? "--"}</td>
+          </tr>
+          <tr>
+            <td class="attr-key">Approx. Size</td>
+            <td class="attr-val">~1.25 GB</td>
+          </tr>
+          <tr>
+            <td class="attr-key">Download Status</td>
+            <td class="attr-val" style="color:${isDownloaded ? 'var(--status-success)' : 'var(--text-muted)'}; font-weight:700;">
+              ${isDownloaded ? "✓ COMPLETED" : "NOT DOWNLOADED"}
+            </td>
+          </tr>
+          <tr>
+            <td class="attr-key">SAR Preprocessed</td>
+            <td class="attr-val" style="color:${isPreprocessed ? 'var(--accent-cyan)' : 'var(--text-muted)'}; font-weight:700;">
+              ${isPreprocessed ? `✓ ${processedPols.join(', ')} COMPLETED` : "PENDING"}
+            </td>
+          </tr>
+          <tr>
+            <td class="attr-key">Prototype Flood Detection</td>
+            <td class="attr-val" style="color:${hasFlood ? '#38bdf8' : 'var(--text-muted)'}; font-weight:700;">
+              ${hasFlood ? `✓ ${floodPols.join(', ')} DETECTED` : isPreprocessed ? "READY" : "AWAITING PREPROCESS"}
+            </td>
+          </tr>
+          <tr>
+            <td class="attr-key">Bounding Box</td>
+            <td class="attr-val" style="font-family:monospace; font-size:10px;">[${bboxStr}]</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="details-actions-bar">
+        ${isDownloaded ? `
+          <button type="button" class="btn-card-action btn-process-action" id="details-open-proc-modal-btn">
+            ⚙️ Process SAR
+          </button>
+          ${isPreprocessed ? `
+            <button type="button" class="btn-card-action btn-flood-action" id="details-open-flood-modal-btn">
+              🌊 Detect Potential Flood
+            </button>
+          ` : ""}
+        ` : `
+          <button type="button" class="btn-card-action btn-download-action" id="details-trigger-dl-btn">
+            📥 Download Product (~1.25 GB)
+          </button>
+        `}
+        ${p.stac_item_url ? `
+          <a href="${p.stac_item_url}" target="_blank" rel="noopener noreferrer" class="btn-card-action btn-details-action" style="text-decoration:none; text-align:center;">
+            🔗 View STAC Metadata Item
+          </a>
+        ` : ""}
+      </div>
+    </div>
+  `;
+
+  // Attach event handlers inside details panel
+  const procModalBtn = activeEl.querySelector<HTMLButtonElement>("#details-open-proc-modal-btn");
+  if (procModalBtn) {
+    procModalBtn.addEventListener("click", () => {
+      openSarProcessingModal(p, sarStatus);
+    });
+  }
+
+  const floodModalBtn = activeEl.querySelector<HTMLButtonElement>("#details-open-flood-modal-btn");
+  if (floodModalBtn) {
+    floodModalBtn.addEventListener("click", () => {
+      openFloodDetectionModal(p, "VV");
+    });
+  }
+
+  const triggerDlBtn = activeEl.querySelector<HTMLButtonElement>("#details-trigger-dl-btn");
+  if (triggerDlBtn) {
+    triggerDlBtn.addEventListener("click", () => {
+      if (p.product_id) {
+        handleInitiateSentinel1Download(p.product_id, selectedLocationId, 0);
+      }
+    });
+  }
+}
+
+function updateMapFloodFootprint(floodStatus: FloodDetectionStatusResponse | null) {
+  if (s1FloodLayer) {
+    try {
+      map.removeLayer(s1FloodLayer);
+    } catch {}
+    s1FloodLayer = null;
+  }
+  if (!floodStatus || !floodStatus.detected_metadata) return;
+
+  const pols = Object.keys(floodStatus.detected_metadata);
+  if (pols.length === 0) return;
+  const meta = floodStatus.detected_metadata[pols[0]];
+  if (!meta || !meta.bounds || meta.bounds.length < 4) return;
+
+  const [w, s, e, n] = meta.bounds;
+  const bounds = L.latLngBounds([s, w], [n, e]);
+
+  s1FloodLayer = L.rectangle(bounds, {
+    color: "#00f0ff",
+    weight: 2,
+    dashArray: "4, 4",
+    fillColor: "#0284c7",
+    fillOpacity: 0.18,
+  }).addTo(map);
+
+  s1FloodLayer.bindTooltip(
+    `<strong>🌊 Potential Flood Candidate Region [${meta.polarization}]</strong><br>` +
+    `Candidate Area: <b>${meta.detected_area_km2} km²</b> (${meta.flood_percentage}%)<br>` +
+    `Threshold: DN &le; ${meta.threshold_used}<br>` +
+    `<small style="color:#94a3b8;">GeoTIFF: ${meta.output_file}</small>`,
+    { sticky: true }
+  );
+}
+
+function renderGlobalProcessingResults(
+  sarStatus?: SarStatusResponse | null,
+  floodStatus?: FloodDetectionStatusResponse | null,
+  activeTab: "sar" | "flood" = currentResultsTab,
+  chosenPol?: string
+) {
+  const emptyEl = document.querySelector<HTMLElement>("#empty-results-state");
+  const activeEl = document.querySelector<HTMLElement>("#active-results-content");
+  if (!emptyEl || !activeEl) return;
+
+  currentResultsTab = activeTab;
+
+  const sarMetaDict = sarStatus?.processed_metadata || {};
+  const sarKeys = Object.keys(sarMetaDict);
+  const floodMetaDict = floodStatus?.detected_metadata || {};
+  const floodKeys = Object.keys(floodMetaDict);
+
+  if (sarKeys.length === 0 && floodKeys.length === 0) {
+    emptyEl.style.display = "flex";
+    activeEl.style.display = "none";
+    return;
+  }
+
+  emptyEl.style.display = "none";
+  activeEl.style.display = "block";
+
+  // Tab Header HTML
+  const tabHeaderHtml = `
+    <div class="results-tab-bar">
+      <button type="button" class="results-tab-btn ${activeTab === 'sar' ? 'active' : ''}" id="tab-btn-sar-results">
+        <span>⚙️</span> Prototype SAR Preprocessing (${sarKeys.length})
+      </button>
+      <button type="button" class="results-tab-btn ${activeTab === 'flood' ? 'active' : ''}" id="tab-btn-flood-results">
+        <span>🌊</span> Prototype Flood Detection (${floodKeys.length})
+      </button>
+    </div>
+  `;
+
+  if (activeTab === "sar") {
+    if (sarKeys.length === 0) {
+      activeEl.innerHTML = `
+        ${tabHeaderHtml}
+        <div class="empty-results-state" style="padding: 24px 10px;">
+          <div class="empty-results-icon">⚙️</div>
+          <div class="empty-title">SAR Preprocessing Pending</div>
+          <div class="empty-desc">Run SAR Preprocessing to generate preprocessed SAR rasters and Digital Number (DN) statistics.</div>
+        </div>
+      `;
+      setupTabButtons(sarStatus, floodStatus);
+      return;
+    }
+
+    const currentPol = chosenPol && sarMetaDict[chosenPol] ? chosenPol : sarKeys[0];
+    const meta = sarMetaDict[currentPol];
+
+    const boundsStr = meta?.bounds && meta.bounds.length >= 4
+      ? `[${meta.bounds.map(b => Number(b).toFixed(4)).join(", ")}]`
+      : "--";
+
+    activeEl.innerHTML = `
+      ${tabHeaderHtml}
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+        <div style="font-size:12px; font-weight:700; color:var(--text-main);">
+          Preprocessed SAR Raster: <code style="color:var(--accent-cyan);">${meta.product_id || '--'}</code>
+        </div>
+        <div style="display:flex; gap:6px;">
+          ${sarKeys.map(k => `
+            <button type="button" class="sar-pol-tab ${k === currentPol ? 'active' : ''}" data-pol="${k}" style="padding:2px 8px; font-size:11px; font-weight:700; border-radius:4px; border:1px solid ${k === currentPol ? 'var(--accent-cyan)' : 'var(--border-subtle)'}; background:${k === currentPol ? 'rgba(0,240,255,0.15)' : 'transparent'}; color:${k === currentPol ? 'var(--accent-cyan)' : 'var(--text-secondary)'}; cursor:pointer;">
+              ${k}
+            </button>
+          `).join('')}
+        </div>
+      </div>
+
+      <div class="proc-results-grid">
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">Polarization</span>
+          <span class="proc-metric-value">${meta.polarization || currentPol}</span>
+        </div>
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">Dimensions</span>
+          <span class="proc-metric-value">${meta.width ?? "--"} × ${meta.height ?? "--"} px</span>
+        </div>
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">Spatial CRS</span>
+          <span class="proc-metric-value" style="font-size:11px;">${meta.crs || "--"}</span>
+        </div>
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">Output Status</span>
+          <span class="proc-metric-value" style="color:var(--status-success);">${meta.processing_status || "COMPLETED"}</span>
+        </div>
+
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">Min Backscatter (DN)</span>
+          <span class="proc-metric-value">${meta.min_value !== undefined ? meta.min_value : "--"}</span>
+        </div>
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">Max Backscatter (DN)</span>
+          <span class="proc-metric-value">${meta.max_value !== undefined ? meta.max_value : "--"}</span>
+        </div>
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">Mean Backscatter (DN)</span>
+          <span class="proc-metric-value">${meta.mean_value !== undefined ? meta.mean_value : "--"}</span>
+        </div>
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">NoData Value</span>
+          <span class="proc-metric-value">${meta.nodata !== undefined ? meta.nodata : "--"}</span>
+        </div>
+
+        <div class="proc-file-row">
+          <span class="proc-metric-label">Processed GeoTIFF Output Path</span>
+          <code style="font-size:10.5px; color:var(--accent-blue); word-break:break-all;">${meta.output_file || "--"}</code>
+        </div>
+
+        <div class="proc-file-row">
+          <span class="proc-metric-label">Spatial Bounds [W, S, E, N]</span>
+          <code style="font-size:10.5px; color:var(--text-secondary);">${boundsStr}</code>
+        </div>
+
+        <div class="proc-disclaimer-note">
+          Prototype SAR Preprocessing. Radiometric statistics and geospatial raster generated.
+          No flood detection, water classification, or AI prediction applied.
+        </div>
+      </div>
+    `;
+
+    // Attach SAR pol tab listeners
+    activeEl.querySelectorAll<HTMLButtonElement>(".sar-pol-tab").forEach(tab => {
+      tab.addEventListener("click", () => {
+        const p = tab.getAttribute("data-pol");
+        if (p) renderGlobalProcessingResults(sarStatus, floodStatus, "sar", p);
+      });
+    });
+    setupTabButtons(sarStatus, floodStatus);
+
+  } else {
+    // Flood Detection Results Tab
+    if (floodKeys.length === 0) {
+      activeEl.innerHTML = `
+        ${tabHeaderHtml}
+        <div class="empty-results-state" style="padding: 24px 10px;">
+          <div class="empty-results-icon">🌊</div>
+          <div class="empty-title">Flood Detection Ready</div>
+          <div class="empty-desc" style="margin-bottom:14px;">
+            SAR preprocessing is complete. Run Prototype SAR Flood Detection to classify low-backscatter flood water candidates.
+          </div>
+          <button type="button" class="action-btn btn-flood-action" id="results-trigger-flood-modal-btn" style="padding:7px 20px; font-size:12px; margin:0 auto; display:inline-flex;">
+            🌊 Run Flood Detection
+          </button>
+        </div>
+      `;
+
+      const runBtn = activeEl.querySelector<HTMLButtonElement>("#results-trigger-flood-modal-btn");
+      if (runBtn) {
+        runBtn.addEventListener("click", () => {
+          if (selectedSentinel1Product) {
+            openFloodDetectionModal(selectedSentinel1Product, "VV");
+          }
+        });
+      }
+      setupTabButtons(sarStatus, floodStatus);
+      return;
+    }
+
+    const currentPol = chosenPol && floodMetaDict[chosenPol] ? chosenPol : floodKeys[0];
+    const meta = floodMetaDict[currentPol];
+
+    activeEl.innerHTML = `
+      ${tabHeaderHtml}
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+        <div>
+          <h3 style="font-size:13px; font-weight:700; color:var(--text-main); margin:0 0 2px 0;">Flood Detection Results</h3>
+          <span style="font-size:11px; color:var(--text-muted);">
+            Product: <code style="color:var(--accent-cyan); font-size:10.5px;">${meta.product_id}</code>
+          </span>
+        </div>
+        <div style="display:flex; gap:6px;">
+          ${floodKeys.map(k => `
+            <button type="button" class="flood-pol-tab ${k === currentPol ? 'active' : ''}" data-pol="${k}" style="padding:2px 8px; font-size:11px; font-weight:700; border-radius:4px; border:1px solid ${k === currentPol ? 'var(--accent-cyan)' : 'var(--border-subtle)'}; background:${k === currentPol ? 'rgba(0,240,255,0.15)' : 'transparent'}; color:${k === currentPol ? 'var(--accent-cyan)' : 'var(--text-secondary)'}; cursor:pointer;">
+              ${k}
+            </button>
+          `).join('')}
+        </div>
+      </div>
+
+      <div class="proc-results-grid">
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">Method</span>
+          <span class="proc-metric-value" style="font-size:11px;">Prototype SAR Flood Detection</span>
+        </div>
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">Polarization</span>
+          <span class="proc-metric-value">${meta.polarization || currentPol}</span>
+        </div>
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">Threshold Used (DN)</span>
+          <span class="proc-metric-value">${meta.threshold_used ?? "--"}</span>
+        </div>
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">Detection Status</span>
+          <span class="proc-metric-value" style="color:var(--status-success);">${meta.processing_status || "COMPLETED"}</span>
+        </div>
+
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">Candidate Flood Area</span>
+          <span class="proc-metric-value" style="color:#38bdf8;">${meta.detected_area_km2 ?? "--"} km²</span>
+        </div>
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">Affected Area</span>
+          <span class="proc-metric-value" style="color:#f59e0b;">${meta.flood_percentage ?? "--"}%</span>
+        </div>
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">Candidate Pixels</span>
+          <span class="proc-metric-value">${meta.candidate_flood_pixels?.toLocaleString() ?? meta.flood_pixel_count?.toLocaleString() ?? "--"}</span>
+        </div>
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">Valid Analyzed Pixels</span>
+          <span class="proc-metric-value">${meta.valid_pixels?.toLocaleString() ?? meta.valid_pixel_count?.toLocaleString() ?? "--"}</span>
+        </div>
+
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">Analyzed Area</span>
+          <span class="proc-metric-value">${meta.analyzed_area_km2 ?? "--"} km²</span>
+        </div>
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">Raster Dimensions</span>
+          <span class="proc-metric-value">${meta.width ?? "--"} × ${meta.height ?? "--"} px</span>
+        </div>
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">Spatial CRS</span>
+          <span class="proc-metric-value" style="font-size:11px;">${meta.crs || "--"}</span>
+        </div>
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">NoData Value</span>
+          <span class="proc-metric-value">${meta.nodata ?? -9999}</span>
+        </div>
+
+        <div class="proc-file-row">
+          <span class="proc-metric-label">Flood Mask GeoTIFF Raster</span>
+          <code style="font-size:10.5px; color:var(--accent-blue); word-break:break-all;">${meta.output_file || "--"}</code>
+        </div>
+
+        <div class="proc-file-row">
+          <span class="proc-metric-label">Area Calculation Method</span>
+          <code style="font-size:10.5px; color:var(--accent-cyan);">${meta.area_calculation_method || "WGS-84 Ellipsoidal Geodesic Pixel Area"}</code>
+        </div>
+
+        <div class="proc-disclaimer-note" style="border-left-color:#f59e0b; background:rgba(245, 158, 11, 0.08); color:var(--text-secondary);">
+          <strong>Prototype Notice:</strong> Potential Flood / Low-Backscatter Candidate Mask. This is not scientifically validated flood classification. No radiometric calibration, terrain correction, or speckle filtering applied.
+        </div>
+      </div>
+    `;
+
+    // Attach flood pol tab listeners
+    activeEl.querySelectorAll<HTMLButtonElement>(".flood-pol-tab").forEach(tab => {
+      tab.addEventListener("click", () => {
+        const p = tab.getAttribute("data-pol");
+        if (p) renderGlobalProcessingResults(sarStatus, floodStatus, "flood", p);
+      });
+    });
+    setupTabButtons(sarStatus, floodStatus);
+  }
+}
+
+function setupTabButtons(sarStatus?: SarStatusResponse | null, floodStatus?: FloodDetectionStatusResponse | null) {
+  const sarBtn = document.querySelector<HTMLButtonElement>("#tab-btn-sar-results");
+  const floodBtn = document.querySelector<HTMLButtonElement>("#tab-btn-flood-results");
+  if (sarBtn) {
+    sarBtn.addEventListener("click", () => {
+      renderGlobalProcessingResults(sarStatus, floodStatus, "sar");
+    });
+  }
+  if (floodBtn) {
+    floodBtn.addEventListener("click", () => {
+      renderGlobalProcessingResults(sarStatus, floodStatus, "flood");
+    });
+  }
+}
+
+function openSarProcessingModal(product: Sentinel1Product, sarStatus?: SarStatusResponse | null) {
+  const modal = document.querySelector<HTMLElement>("#s1-sar-process-modal");
+  const prodIdEl = document.querySelector<HTMLElement>("#sar-modal-product-id");
+  const locEl = document.querySelector<HTMLElement>("#sar-modal-location");
+  const dateEl = document.querySelector<HTMLElement>("#sar-modal-date");
+  const statusMsgEl = document.querySelector<HTMLElement>("#sar-modal-status-msg");
+  const selectorEl = document.querySelector<HTMLElement>("#sar-modal-pol-selector");
+  const proceedBtn = document.querySelector<HTMLButtonElement>("#sar-modal-proceed-btn");
+
+  if (!modal) return;
+
+  if (prodIdEl) prodIdEl.textContent = product.product_id || "--";
+  if (locEl) locEl.textContent = selectedLocationName;
+  if (dateEl) dateEl.textContent = product.acquisition_date ? product.acquisition_date.slice(0, 10) : "--";
+  if (statusMsgEl) {
+    statusMsgEl.style.display = "none";
+    statusMsgEl.textContent = "";
+  }
+
+  const pols = sarStatus?.available_polarizations && sarStatus.available_polarizations.length > 0
+    ? sarStatus.available_polarizations
+    : ["VV", "VH"];
+
+  selectedModalPol = pols[0] || "VV";
+
+  if (selectorEl) {
+    selectorEl.innerHTML = pols.map(pol => `
+      <button type="button" class="sar-pol-btn ${pol === selectedModalPol ? 'active' : ''}" data-pol="${pol}">
+        ${pol}
+      </button>
+    `).join('');
+
+    selectorEl.querySelectorAll<HTMLButtonElement>(".sar-pol-btn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const p = btn.getAttribute("data-pol");
+        if (!p) return;
+        selectedModalPol = p;
+        selectorEl.querySelectorAll(".sar-pol-btn").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+      });
+    });
+  }
+
+  modal.style.display = "flex";
+
+  if (proceedBtn) {
+    const newBtn = proceedBtn.cloneNode(true) as HTMLButtonElement;
+    proceedBtn.parentNode?.replaceChild(newBtn, proceedBtn);
+
+    newBtn.addEventListener("click", async () => {
+      if (!product.product_id) return;
+      newBtn.disabled = true;
+      newBtn.textContent = "Processing Sentinel-1 SAR...";
+      if (statusMsgEl) {
+        statusMsgEl.style.display = "block";
+        statusMsgEl.className = "sar-modal-status-msg s1-status-info";
+        statusMsgEl.textContent = "⚙️ Prototype SAR preprocessing & raster preparation in progress...";
+      }
+
+      updateProcessingTimeline({
+        validated: true,
+        downloaded: true,
+        preprocessing: true,
+        badge: "PREPROCESSING"
+      });
+
+      try {
+        const res = await requestSarPreprocessing(product.product_id, selectedModalPol);
+        if (res.status === "success" || res.status === "already_processed") {
+          if (statusMsgEl) {
+            statusMsgEl.className = "sar-modal-status-msg s1-status-success";
+            statusMsgEl.textContent = "✓ SAR preprocessing completed successfully.";
+          }
+          if (sarStatus) {
+            sarStatus.processed_metadata = sarStatus.processed_metadata || {};
+            sarStatus.processed_metadata[selectedModalPol] = res;
+            if (!sarStatus.processed_polarizations.includes(selectedModalPol)) {
+              sarStatus.processed_polarizations.push(selectedModalPol);
+            }
+          }
+          renderProductDetails(product, sarStatus, selectedSentinel1FloodStatus);
+          renderGlobalProcessingResults(sarStatus, selectedSentinel1FloodStatus, "sar", selectedModalPol);
+          updateWorkflowStepper({
+            discoverDone: true,
+            downloadDone: true,
+            preprocessDone: true,
+            floodActive: true,
+          });
+          updateProcessingTimeline({
+            validated: true,
+            downloaded: true,
+            preprocessed: true,
+            floodReady: true,
+            badge: "COMPLETED"
+          });
+          setTimeout(() => {
+            modal.style.display = "none";
+          }, 1500);
+        } else {
+          if (statusMsgEl) {
+            statusMsgEl.className = "sar-modal-status-msg s1-status-error";
+            statusMsgEl.textContent = `✕ SAR preprocessing error: ${res.message || "Failed"}`;
+          }
+        }
+      } catch (err: any) {
+        if (statusMsgEl) {
+          statusMsgEl.className = "sar-modal-status-msg s1-status-error";
+          statusMsgEl.textContent = `✕ Request failed: ${err?.response?.data?.message || err?.message || "Error"}`;
+        }
+      } finally {
+        newBtn.disabled = false;
+        newBtn.textContent = "⚙️ Process SAR";
+      }
+    });
+  }
+}
+
+function closeSarProcessingModal() {
+  const modal = document.querySelector<HTMLElement>("#s1-sar-process-modal");
+  if (modal) modal.style.display = "none";
+}
+
+function openFloodDetectionModal(product: Sentinel1Product, defaultPol: string = "VV") {
+  const modal = document.querySelector<HTMLElement>("#s1-flood-detect-modal");
+  const prodIdEl = document.querySelector<HTMLElement>("#flood-modal-product-id");
+  const locEl = document.querySelector<HTMLElement>("#flood-modal-location");
+  const dateEl = document.querySelector<HTMLElement>("#flood-modal-date");
+  const statusMsgEl = document.querySelector<HTMLElement>("#flood-modal-status-msg");
+  const selectorEl = document.querySelector<HTMLElement>("#flood-modal-pol-selector");
+  const threshInput = document.querySelector<HTMLInputElement>("#flood-modal-threshold");
+  const threshHint = document.querySelector<HTMLElement>("#flood-modal-threshold-hint");
+  const proceedBtn = document.querySelector<HTMLButtonElement>("#flood-modal-proceed-btn");
+
+  if (!modal) return;
+
+  if (prodIdEl) prodIdEl.textContent = product.product_id || "--";
+  if (locEl) locEl.textContent = selectedLocationName;
+  if (dateEl) dateEl.textContent = product.acquisition_date ? product.acquisition_date.slice(0, 10) : "--";
+  if (statusMsgEl) {
+    statusMsgEl.style.display = "none";
+    statusMsgEl.textContent = "";
+  }
+
+  // Preprocessed polarizations take precedence
+  const availPols = selectedSentinel1SarStatus?.processed_polarizations && selectedSentinel1SarStatus.processed_polarizations.length > 0
+    ? selectedSentinel1SarStatus.processed_polarizations
+    : ["VV", "VH"];
+
+  selectedFloodModalPol = availPols.includes(defaultPol) ? defaultPol : availPols[0] || "VV";
+
+  if (threshInput) {
+    threshInput.value = selectedFloodModalPol === "VH" ? "75" : "150";
+  }
+  if (threshHint) {
+    threshHint.textContent = `Default: ${selectedFloodModalPol === 'VH' ? '75.0' : '150.0'} (${selectedFloodModalPol})`;
+  }
+
+  if (selectorEl) {
+    selectorEl.innerHTML = availPols.map(pol => `
+      <button type="button" class="sar-pol-btn ${pol === selectedFloodModalPol ? 'active' : ''}" data-pol="${pol}">
+        ${pol}
+      </button>
+    `).join('');
+
+    selectorEl.querySelectorAll<HTMLButtonElement>(".sar-pol-btn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const p = btn.getAttribute("data-pol");
+        if (!p) return;
+        selectedFloodModalPol = p;
+        selectorEl.querySelectorAll(".sar-pol-btn").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+
+        if (threshInput) {
+          threshInput.value = p === "VH" ? "75" : "150";
+        }
+        if (threshHint) {
+          threshHint.textContent = `Default: ${p === 'VH' ? '75.0' : '150.0'} (${p})`;
+        }
+      });
+    });
+  }
+
+  modal.style.display = "flex";
+
+  if (proceedBtn) {
+    const newBtn = proceedBtn.cloneNode(true) as HTMLButtonElement;
+    proceedBtn.parentNode?.replaceChild(newBtn, proceedBtn);
+
+    newBtn.addEventListener("click", async () => {
+      if (!product.product_id) return;
+      newBtn.disabled = true;
+      newBtn.textContent = "Detecting potential flood areas...";
+      if (statusMsgEl) {
+        statusMsgEl.style.display = "block";
+        statusMsgEl.className = "sar-modal-status-msg s1-status-info";
+        statusMsgEl.textContent = "🌊 Analyzing low-backscatter radar returns...";
+      }
+
+      updateProcessingTimeline({
+        validated: true,
+        downloaded: true,
+        preprocessed: true,
+        floodDetecting: true,
+        badge: "DETECTING"
+      });
+
+      try {
+        const thresholdVal = threshInput ? parseFloat(threshInput.value) : undefined;
+        const res = await requestFloodDetection(product.product_id, selectedFloodModalPol, thresholdVal);
+
+        if (res.status === "success" || res.status === "already_processed") {
+          if (statusMsgEl) {
+            statusMsgEl.className = "sar-modal-status-msg s1-status-success";
+            statusMsgEl.textContent = `✓ Flood detection completed: ${res.detected_area_km2} km² candidate flood area (${res.flood_percentage}%)`;
+          }
+
+          if (!selectedSentinel1FloodStatus) {
+            selectedSentinel1FloodStatus = {
+              product_id: product.product_id,
+              status: "COMPLETED",
+              detected_polarizations: [selectedFloodModalPol],
+              detected_metadata: { [selectedFloodModalPol]: res },
+            };
+          } else {
+            selectedSentinel1FloodStatus.detected_metadata = selectedSentinel1FloodStatus.detected_metadata || {};
+            selectedSentinel1FloodStatus.detected_metadata[selectedFloodModalPol] = res;
+            if (!selectedSentinel1FloodStatus.detected_polarizations) {
+              selectedSentinel1FloodStatus.detected_polarizations = [];
+            }
+            if (!selectedSentinel1FloodStatus.detected_polarizations.includes(selectedFloodModalPol)) {
+              selectedSentinel1FloodStatus.detected_polarizations.push(selectedFloodModalPol);
+            }
+            selectedSentinel1FloodStatus.status = "COMPLETED";
+          }
+
+          currentResultsTab = "flood";
+          renderProductDetails(product, selectedSentinel1SarStatus, selectedSentinel1FloodStatus);
+          renderGlobalProcessingResults(selectedSentinel1SarStatus, selectedSentinel1FloodStatus, "flood", selectedFloodModalPol);
+
+          updateWorkflowStepper({
+            discoverDone: true,
+            downloadDone: true,
+            preprocessDone: true,
+            floodDone: true,
+          });
+
+          updateProcessingTimeline({
+            validated: true,
+            downloaded: true,
+            preprocessed: true,
+            floodDetected: true,
+            badge: "FLOOD DETECTED"
+          });
+
+          updateMapFloodFootprint(selectedSentinel1FloodStatus);
+
+          setTimeout(() => {
+            modal.style.display = "none";
+          }, 1400);
+        } else {
+          if (statusMsgEl) {
+            statusMsgEl.className = "sar-modal-status-msg s1-status-error";
+            statusMsgEl.textContent = `✕ Flood detection error: ${res.message || "Failed"}`;
+          }
+        }
+      } catch (err: any) {
+        if (statusMsgEl) {
+          statusMsgEl.className = "sar-modal-status-msg s1-status-error";
+          statusMsgEl.textContent = `✕ Request failed: ${err?.response?.data?.message || err?.message || "Error"}`;
+        }
+      } finally {
+        newBtn.disabled = false;
+        newBtn.textContent = "🌊 Run Flood Detection";
+      }
+    });
+  }
+}
+
+function closeFloodDetectionModal() {
+  const modal = document.querySelector<HTMLElement>("#s1-flood-detect-modal");
+  if (modal) modal.style.display = "none";
+}
+
+function selectProduct(p: Sentinel1Product, index: number) {
+  selectedSentinel1Product = p;
+
+  // Highlight active product card
+  document.querySelectorAll<HTMLElement>(".s1-product-item-card").forEach((card, idx) => {
+    if (idx === index) {
+      card.classList.add("active-product-card");
+    } else {
+      card.classList.remove("active-product-card");
+    }
+  });
+
+  if (!p.product_id) return;
+
+  Promise.all([
+    fetchSarProductStatus(p.product_id),
+    fetchFloodDetectionStatus(p.product_id).catch(() => null),
+  ])
+    .then(([sarStatus, floodStatus]) => {
+      selectedSentinel1SarStatus = sarStatus;
+      selectedSentinel1FloodStatus = floodStatus;
+
+      const isDl = sarStatus.is_downloaded;
+      const isProc = sarStatus.processed_polarizations && sarStatus.processed_polarizations.length > 0;
+      const hasFlood = floodStatus && floodStatus.detected_polarizations && floodStatus.detected_polarizations.length > 0;
+
+      if (hasFlood) {
+        currentResultsTab = "flood";
+      } else if (isProc) {
+        currentResultsTab = "sar";
+      }
+
+      renderProductDetails(p, sarStatus, floodStatus);
+      renderGlobalProcessingResults(sarStatus, floodStatus, currentResultsTab);
+
+      updateWorkflowStepper({
+        discoverDone: true,
+        downloadActive: !isDl,
+        downloadDone: isDl,
+        preprocessActive: isDl && !isProc,
+        preprocessDone: isProc,
+        floodActive: isProc && !hasFlood,
+        floodDone: Boolean(hasFlood),
+      });
+
+      updateProcessingTimeline({
+        validated: true,
+        downloaded: isDl,
+        preprocessed: isProc,
+        floodReady: isProc && !hasFlood,
+        floodDetected: Boolean(hasFlood),
+        badge: hasFlood ? "FLOOD DETECTED" : isProc ? "PREPROCESSED" : isDl ? "DOWNLOADED" : "VALIDATED"
+      });
+
+      updateMapFloodFootprint(floodStatus);
+    })
+    .catch(() => {
+      renderProductDetails(p, null, null);
+      renderGlobalProcessingResults(null, null);
+    });
+}
 
 function renderSentinel1Products(data: Sentinel1ProductResponse) {
   const container = document.querySelector<HTMLElement>("#s1-products-container");
@@ -1971,6 +4478,8 @@ function renderSentinel1Products(data: Sentinel1ProductResponse) {
   const statusBar = document.querySelector<HTMLElement>("#s1-discovery-status");
 
   if (!container) return;
+
+  currentDiscoveredProducts = data.products || [];
 
   if (locationNameEl) {
     locationNameEl.textContent = data.location?.name || "--";
@@ -1994,6 +4503,9 @@ function renderSentinel1Products(data: Sentinel1ProductResponse) {
       statusBar.className = "s1-discovery-status-bar s1-status-info";
       statusBar.textContent = `Copernicus STAC query completed — 0 products found for last ${data.query?.days ?? 7} days.`;
     }
+    renderProductDetails(null);
+    renderGlobalProcessingResults(null);
+    updateWorkflowStepper({ discoverDone: false });
     return;
   }
 
@@ -2003,101 +4515,109 @@ function renderSentinel1Products(data: Sentinel1ProductResponse) {
     statusBar.textContent = `Copernicus Data Space returned ${data.count} Sentinel-1 GRD product(s) — metadata only, no data downloaded.`;
   }
 
+  updateWorkflowStepper({ discoverDone: true, downloadActive: true });
+  updateProcessingTimeline({ validated: true, badge: "VALIDATED" });
+
   container.innerHTML = data.products
     .map((p, i) => {
-      const acqDate = p.acquisition_date ? p.acquisition_date.slice(0, 10) : "--";
+      const acqDate = p.acquisition_date ? p.acquisition_date.replace("T", " ").slice(0, 16) + " UTC" : "--";
       const productIdShort =
-        p.product_id && p.product_id.length > 60
-          ? p.product_id.slice(0, 57) + "..."
+        p.product_id && p.product_id.length > 34
+          ? p.product_id.slice(0, 31) + "..."
           : (p.product_id || "--");
-      const bboxStr = p.bbox ? p.bbox.map((v) => v.toFixed(4)).join(", ") : "--";
 
       return `
-        <div class="s1-product-card">
-          <div class="s1-product-header">
-            <span class="s1-product-index">#${i + 1}</span>
-            <span class="s1-product-type">${p.product_type || "GRD"} · SAR</span>
-            <span class="provenance-tag tag-stac" style="font-size:10px;">COPERNICUS DATA SPACE</span>
-            <span class="provenance-tag tag-proto" style="font-size:10px; margin-left:4px;">DISCOVERY ONLY</span>
-          </div>
-          <div class="s1-product-grid">
-            <div class="s1-field">
-              <span class="s1-field-label">Product ID</span>
-              <code class="s1-field-value" title="${p.product_id || ''}">${productIdShort}</code>
+        <div class="s1-product-item-card" id="s1-product-card-${i}" data-index="${i}">
+          <div class="product-card-top">
+            <div class="radar-thumbnail">
+              <svg viewBox="0 0 40 40" class="radar-sweep-icon">
+                <circle cx="20" cy="20" r="18" stroke="rgba(0, 240, 255, 0.2)" stroke-width="1" fill="none" />
+                <circle cx="20" cy="20" r="12" stroke="rgba(0, 240, 255, 0.3)" stroke-width="1" fill="none" />
+                <circle cx="20" cy="20" r="6" stroke="rgba(0, 240, 255, 0.4)" stroke-width="1" fill="none" />
+                <line x1="20" y1="20" x2="35" y2="9" stroke="#00f0ff" stroke-width="1.5" stroke-linecap="round" />
+                <circle cx="20" cy="20" r="2" fill="#00f0ff" />
+              </svg>
             </div>
-            <div class="s1-field">
-              <span class="s1-field-label">Acquisition Date</span>
-              <span class="s1-field-value s1-date">${acqDate}</span>
-            </div>
-            <div class="s1-field">
-              <span class="s1-field-label">Platform</span>
-              <span class="s1-field-value">${p.platform || "--"}</span>
-            </div>
-            <div class="s1-field">
-              <span class="s1-field-label">Product Type</span>
-              <span class="s1-field-value">${p.product_type || "--"}</span>
-            </div>
-            <div class="s1-field">
-              <span class="s1-field-label">Polarization</span>
-              <span class="s1-field-value">${p.polarization || "--"}</span>
-            </div>
-            <div class="s1-field">
-              <span class="s1-field-label">Orbit Direction</span>
-              <span class="s1-field-value">${p.orbit_direction || "--"}</span>
-            </div>
-            <div class="s1-field">
-              <span class="s1-field-label">Relative Orbit</span>
-              <span class="s1-field-value">${p.relative_orbit !== null && p.relative_orbit !== undefined ? p.relative_orbit : "--"}</span>
-            </div>
-            <div class="s1-field">
-              <span class="s1-field-label">Sensor Mode</span>
-              <span class="s1-field-value">${p.sensor || "SAR"}</span>
-            </div>
-            <div class="s1-field">
-              <span class="s1-field-label">Cloud Cover</span>
-              <span class="s1-field-value s1-dim">N/A (SAR)</span>
-            </div>
-            <div class="s1-field">
-              <span class="s1-field-label">Bounding Box</span>
-              <span class="s1-field-value s1-dim" style="font-family:monospace; font-size:10px;">[${bboxStr}]</span>
-            </div>
-            <div class="s1-field">
-              <span class="s1-field-label">Data Source</span>
-              <span class="s1-field-value" style="color:var(--accent-blue);">${p.data_source}</span>
-            </div>
-            <div class="s1-field">
-              <span class="s1-field-label">Download Status</span>
-              <span class="s1-field-value s1-not-downloaded" id="s1-dl-badge-${i}">NOT DOWNLOADED</span>
+            <div class="product-card-info">
+              <div class="product-id-row" title="${p.product_id || ''}">${productIdShort}</div>
+              <div class="product-datetime">${acqDate}</div>
+              <div class="product-pills-row">
+                <span class="pill-pol">${p.polarization || "VV + VH"}</span>
+                <span class="pill-size">~1.25 GB</span>
+                <span class="pill-status status-avail" id="s1-dl-badge-${i}">AVAILABLE</span>
+              </div>
             </div>
           </div>
-          <div class="s1-product-footer">
-            <div class="s1-product-footer-actions">
-              <button 
-                class="s1-download-btn" 
-                id="s1-download-btn-${i}" 
-                data-product-id="${p.product_id || ''}"
-                data-location-id="${data.location?.location_id || selectedLocationId}"
-                data-index="${i}"
-              >
-                📥 Download
-              </button>
-              <span class="s1-download-msg" id="s1-download-msg-${i}"></span>
-            </div>
-            ${p.stac_item_url ? `
-            <a href="${p.stac_item_url}" target="_blank" rel="noopener noreferrer"
-               class="s1-stac-link">
-              🔗 View STAC Metadata
-            </a>` : ""}
+          <div class="product-card-actions">
+            <button 
+              type="button"
+              class="btn-card-action btn-download-action s1-download-btn" 
+              id="s1-download-btn-${i}" 
+              data-product-id="${p.product_id || ''}"
+              data-location-id="${data.location?.location_id || selectedLocationId}"
+              data-index="${i}"
+            >
+              📥 Download
+            </button>
+            <button 
+              type="button"
+              class="btn-card-action btn-process-action s1-card-proc-btn" 
+              id="s1-process-btn-${i}" 
+              data-product-id="${p.product_id || ''}"
+              data-index="${i}"
+              style="display:none;"
+            >
+              ⚙️ Process SAR
+            </button>
+            <button 
+              type="button"
+              class="btn-card-action btn-flood-action s1-card-flood-btn" 
+              id="s1-flood-btn-${i}" 
+              data-product-id="${p.product_id || ''}"
+              data-index="${i}"
+              style="display:none;"
+            >
+              🌊 Flood Detect
+            </button>
+            <button type="button" class="btn-card-action btn-details-action s1-card-view-btn" data-index="${i}">
+              Details
+            </button>
+          </div>
+          <span class="s1-download-msg" id="s1-download-msg-${i}" style="display:none;"></span>
+          <!-- Inline legacy compatibility container (hidden) -->
+          <div class="s1-sar-process-section" id="s1-sar-process-section-${i}" style="display: none;" data-selected-pol="VV">
+            <div class="s1-pol-selector" id="s1-pol-selector-${i}"></div>
+            <div class="s1-process-msg" id="s1-process-msg-${i}"></div>
+            <div class="s1-process-results" id="s1-process-results-${i}" style="display: none;"></div>
           </div>
         </div>
       `;
     })
     .join("");
 
+  // Attach card selection listener
+  data.products.forEach((p, i) => {
+    const cardEl = container.querySelector<HTMLElement>(`#s1-product-card-${i}`);
+    if (cardEl) {
+      cardEl.addEventListener("click", (e) => {
+        // Prevent click if clicking download or action buttons
+        const target = e.target as HTMLElement;
+        if (target.closest(".s1-download-btn") || target.closest(".s1-card-proc-btn") || target.closest(".s1-card-flood-btn")) return;
+        selectProduct(p, i);
+      });
+    }
+
+    const viewBtn = container.querySelector<HTMLButtonElement>(`.s1-card-view-btn[data-index="${i}"]`);
+    if (viewBtn) {
+      viewBtn.addEventListener("click", () => selectProduct(p, i));
+    }
+  });
+
   // Attach download button listeners to discovered cards
   const downloadBtns = container.querySelectorAll<HTMLButtonElement>(".s1-download-btn");
   downloadBtns.forEach((btn) => {
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
       const prodId = btn.getAttribute("data-product-id");
       const locIdStr = btn.getAttribute("data-location-id");
       const idxStr = btn.getAttribute("data-index");
@@ -2107,6 +4627,92 @@ function renderSentinel1Products(data: Sentinel1ProductResponse) {
       handleInitiateSentinel1Download(prodId, locId, idx);
     });
   });
+
+  // Attach process SAR button listeners to discovered cards
+  const procBtns = container.querySelectorAll<HTMLButtonElement>(".s1-card-proc-btn");
+  procBtns.forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const idxStr = btn.getAttribute("data-index");
+      const idx = idxStr ? parseInt(idxStr, 10) : 0;
+      const prod = data.products[idx];
+      if (prod) {
+        selectProduct(prod, idx);
+        openSarProcessingModal(prod, selectedSentinel1SarStatus);
+      }
+    });
+  });
+
+  // Attach flood detection button listeners to discovered cards
+  const floodBtns = container.querySelectorAll<HTMLButtonElement>(".s1-card-flood-btn");
+  floodBtns.forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const idxStr = btn.getAttribute("data-index");
+      const idx = idxStr ? parseInt(idxStr, 10) : 0;
+      const prod = data.products[idx];
+      if (prod) {
+        selectProduct(prod, idx);
+        openFloodDetectionModal(prod, "VV");
+      }
+    });
+  });
+
+  // Check download, SAR preprocessing, and flood detection status for each card
+  data.products.forEach((p, i) => {
+    if (!p.product_id) return;
+    const prodId = p.product_id;
+    Promise.all([
+      fetchSarProductStatus(prodId),
+      fetchFloodDetectionStatus(prodId).catch(() => null),
+    ])
+      .then(([sarStatus, floodStatus]) => {
+        if (sarStatus.is_downloaded) {
+          const badgeEl = document.querySelector<HTMLElement>(`#s1-dl-badge-${i}`);
+          const hasProc = sarStatus.processed_polarizations && sarStatus.processed_polarizations.length > 0;
+          const hasFlood = floodStatus && floodStatus.detected_polarizations && floodStatus.detected_polarizations.length > 0;
+
+          if (badgeEl) {
+            if (hasFlood) {
+              badgeEl.className = "pill-status status-proc";
+              badgeEl.textContent = "FLOOD DETECTED";
+            } else if (hasProc) {
+              badgeEl.className = "pill-status status-proc";
+              badgeEl.textContent = "PROCESSED";
+            } else {
+              badgeEl.className = "pill-status status-dl";
+              badgeEl.textContent = "DOWNLOADED";
+            }
+          }
+          const dlBtn = document.querySelector<HTMLButtonElement>(`#s1-download-btn-${i}`);
+          if (dlBtn) {
+            dlBtn.disabled = true;
+            dlBtn.textContent = "✓ Downloaded";
+          }
+          const cardProcBtn = document.querySelector<HTMLButtonElement>(`#s1-process-btn-${i}`);
+          if (cardProcBtn) {
+            cardProcBtn.style.display = "inline-block";
+          }
+          const cardFloodBtn = document.querySelector<HTMLButtonElement>(`#s1-flood-btn-${i}`);
+          if (cardFloodBtn && hasProc) {
+            cardFloodBtn.style.display = "inline-block";
+          }
+          setupSarProcessingCard(prodId, i, sarStatus);
+
+          // If this is the currently selected product, update details & results
+          if (selectedSentinel1Product && selectedSentinel1Product.product_id === prodId) {
+            renderProductDetails(selectedSentinel1Product, sarStatus, floodStatus);
+            renderGlobalProcessingResults(sarStatus, floodStatus);
+          }
+        }
+      })
+      .catch(() => {});
+  });
+
+  // Select first product by default
+  if (data.products.length > 0) {
+    selectProduct(data.products[0], 0);
+  }
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -2124,6 +4730,12 @@ function closeSentinel1DownloadModal() {
   pendingDownloadProductId = null;
   pendingDownloadLocationId = null;
   pendingDownloadCardIndex = null;
+}
+
+function openSentinel1DownloadModal(product: Sentinel1Product) {
+  if (product && product.product_id) {
+    handleInitiateSentinel1Download(product.product_id, selectedLocationId, 0);
+  }
 }
 
 async function handleInitiateSentinel1Download(
@@ -2148,10 +4760,8 @@ async function handleInitiateSentinel1Download(
   if (confirmProdIdEl) confirmProdIdEl.textContent = productId;
   if (confirmSizeRowEl) confirmSizeRowEl.style.display = "none";
 
-  // Display confirmation modal before starting download
   if (modalEl) modalEl.style.display = "flex";
 
-  // Pre-fetch product size asynchronously if available
   try {
     const info = await fetchSentinel1DownloadInfo(productId, locationId);
     if (info && info.expected_size_bytes && confirmSizeRowEl && confirmSizeValEl) {
@@ -2176,85 +4786,216 @@ async function handleProceedSentinel1Download() {
   const btn = document.querySelector<HTMLButtonElement>(`#s1-download-btn-${cardIndex}`);
   const msgEl = document.querySelector<HTMLElement>(`#s1-download-msg-${cardIndex}`);
   const badgeEl = document.querySelector<HTMLElement>(`#s1-dl-badge-${cardIndex}`);
+  const cardProcBtn = document.querySelector<HTMLButtonElement>(`#s1-process-btn-${cardIndex}`);
 
-  // Transition to downloading state
   isDownloadingSentinel1 = true;
   if (btn) {
     btn.disabled = true;
     btn.textContent = "Downloading...";
   }
   if (msgEl) {
-    msgEl.className = "s1-download-msg s1-dl-status s1-dl-loading";
-    msgEl.textContent = "Downloading Sentinel-1 product...";
+    msgEl.style.display = "inline";
+    msgEl.textContent = "Downloading...";
   }
+
+  updateProcessingTimeline({
+    validated: true,
+    downloading: true,
+    badge: "DOWNLOADING"
+  });
 
   try {
     const result = await requestSentinel1Download(productId, locationId);
 
-    if (result.status === "downloaded") {
+    if (result.status === "downloaded" || result.status === "already_downloaded") {
       if (btn) {
         btn.disabled = true;
         btn.textContent = "✓ Downloaded";
       }
-      if (msgEl) {
-        msgEl.className = "s1-download-msg s1-dl-status s1-dl-success";
-        msgEl.textContent = "✓ Sentinel-1 product downloaded successfully.";
-      }
       if (badgeEl) {
-        badgeEl.className = "s1-field-value s1-downloaded";
-        badgeEl.textContent = "COMPLETED";
+        badgeEl.className = "pill-status status-dl";
+        badgeEl.textContent = "DOWNLOADED";
       }
-    } else if (result.status === "already_downloaded") {
-      if (btn) {
-        btn.disabled = false;
-        btn.textContent = "✓ Downloaded";
+      if (cardProcBtn) {
+        cardProcBtn.style.display = "inline-block";
       }
-      if (msgEl) {
-        msgEl.className = "s1-download-msg s1-dl-status s1-dl-info";
-        msgEl.textContent = "✓ Product already downloaded.";
-      }
-      if (badgeEl) {
-        badgeEl.className = "s1-field-value s1-downloaded";
-        badgeEl.textContent = "ALREADY EXISTS";
-      }
+
+      fetchSarProductStatus(productId)
+        .then((sarStatus) => {
+          setupSarProcessingCard(productId, cardIndex, sarStatus);
+          if (selectedSentinel1Product && selectedSentinel1Product.product_id === productId) {
+            renderProductDetails(selectedSentinel1Product, sarStatus);
+            renderGlobalProcessingResults(sarStatus);
+          }
+          updateWorkflowStepper({
+            discoverDone: true,
+            downloadDone: true,
+            preprocessActive: true,
+          });
+          updateProcessingTimeline({
+            validated: true,
+            downloaded: true,
+            badge: "DOWNLOADED"
+          });
+        })
+        .catch(() => {});
     } else if (result.status === "authentication_failed") {
       if (btn) {
         btn.disabled = false;
         btn.textContent = "Download";
       }
-      if (msgEl) {
-        msgEl.className = "s1-download-msg s1-dl-status s1-dl-error";
-        msgEl.textContent = "✕ Copernicus authentication failed.";
-      }
+      alert("Copernicus Data Space authentication failed. Please check CDSE credentials.");
     } else {
       if (btn) {
         btn.disabled = false;
         btn.textContent = "Download";
       }
-      if (msgEl) {
-        msgEl.className = "s1-download-msg s1-dl-status s1-dl-error";
-        msgEl.textContent = "✕ Unable to download Sentinel-1 product.";
-      }
+      alert(`Unable to download Sentinel-1 product: ${result.message || "Error"}`);
     }
   } catch (err: any) {
     if (btn) {
       btn.disabled = false;
       btn.textContent = "Download";
     }
-    if (msgEl) {
-      msgEl.className = "s1-download-msg s1-dl-status s1-dl-error";
-      if (err?.response?.data?.status === "authentication_failed") {
-        msgEl.textContent = "✕ Copernicus authentication failed.";
-      } else {
-        msgEl.textContent = "✕ Unable to download Sentinel-1 product.";
-      }
-    }
+    alert(`Download error: ${err?.message || "Failed"}`);
   } finally {
     isDownloadingSentinel1 = false;
     pendingDownloadProductId = null;
     pendingDownloadLocationId = null;
     pendingDownloadCardIndex = null;
   }
+}
+
+// ──────────────────────────────────────────────────────────────
+// SENTINEL-1 PROTOTYPE SAR PREPROCESSING HANDLERS
+// ──────────────────────────────────────────────────────────────
+
+function setupSarProcessingCard(
+  _productId: string,
+  cardIndex: number,
+  sarStatus: SarStatusResponse
+) {
+  const sectionEl = document.querySelector<HTMLElement>(`#s1-sar-process-section-${cardIndex}`);
+  if (!sectionEl) return;
+
+  const selectorEl = document.querySelector<HTMLElement>(`#s1-pol-selector-${cardIndex}`);
+  const msgEl = document.querySelector<HTMLElement>(`#s1-process-msg-${cardIndex}`);
+  const resEl = document.querySelector<HTMLElement>(`#s1-process-results-${cardIndex}`);
+  const procBtn = document.querySelector<HTMLButtonElement>(`#s1-process-btn-${cardIndex}`);
+
+  const pols =
+    sarStatus.available_polarizations && sarStatus.available_polarizations.length > 0
+      ? sarStatus.available_polarizations
+      : ["VV", "VH"];
+
+  let selectedPol = sectionEl.getAttribute("data-selected-pol") || pols[0] || "VV";
+
+  if (selectorEl) {
+    selectorEl.innerHTML = pols
+      .map(
+        (pol) =>
+          `<button type="button" class="s1-pol-btn ${pol === selectedPol ? "active" : ""}" data-pol="${pol}" id="s1-pol-${pol.toLowerCase()}-${cardIndex}">${pol}</button>`
+      )
+      .join("");
+
+    const polBtns = selectorEl.querySelectorAll<HTMLButtonElement>(".s1-pol-btn");
+    polBtns.forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const pol = btn.getAttribute("data-pol");
+        if (!pol) return;
+        selectedPol = pol;
+        sectionEl.setAttribute("data-selected-pol", pol);
+        polBtns.forEach((b) => b.classList.remove("active"));
+        btn.classList.add("active");
+
+        if (sarStatus.processed_metadata && sarStatus.processed_metadata[pol]) {
+          renderSarProcessResults(resEl, msgEl, sarStatus.processed_metadata[pol]);
+        }
+      });
+    });
+  }
+
+  if (procBtn && !procBtn.hasAttribute("data-bound")) {
+    procBtn.setAttribute("data-bound", "true");
+    procBtn.addEventListener("click", () => {
+      const prod = currentDiscoveredProducts[cardIndex];
+      if (prod) {
+        selectProduct(prod, cardIndex);
+        openSarProcessingModal(prod, sarStatus);
+      }
+    });
+  }
+}
+
+function renderSarProcessResults(
+  resEl: HTMLElement | null,
+  msgEl: HTMLElement | null,
+  meta: SarPreprocessResponse
+) {
+  if (msgEl) {
+    msgEl.className = "s1-process-msg s1-dl-status s1-dl-success";
+    msgEl.textContent = "✓ SAR preprocessing completed.";
+  }
+  if (!resEl) return;
+
+  const boundsStr =
+    meta.bounds && meta.bounds.length >= 4
+      ? `[${meta.bounds.map((b) => Number(b).toFixed(4)).join(", ")}]`
+      : "--";
+
+  resEl.style.display = "flex";
+  resEl.innerHTML = `
+    <div class="s1-res-title">
+      <span>✓ SAR Preprocessing Completed</span>
+      <span class="provenance-tag tag-proto" style="font-size:9px;">PROTOTYPE SAR</span>
+    </div>
+    <div class="s1-res-grid">
+      <div class="s1-res-item">
+        <span class="s1-res-label">Polarization</span>
+        <span class="s1-res-value" style="color:var(--accent-cyan); font-weight:700;">${meta.polarization || "--"}</span>
+      </div>
+      <div class="s1-res-item">
+        <span class="s1-res-label">Raster Dimensions</span>
+        <span class="s1-res-value">${meta.width ?? "--"} × ${meta.height ?? "--"} px</span>
+      </div>
+      <div class="s1-res-item">
+        <span class="s1-res-label">Spatial Reference (CRS)</span>
+        <span class="s1-res-value">${meta.crs || "--"}</span>
+      </div>
+      <div class="s1-res-item">
+        <span class="s1-res-label">Min Backscatter (DN)</span>
+        <span class="s1-res-value">${meta.min_value !== undefined ? meta.min_value : "--"}</span>
+      </div>
+      <div class="s1-res-item">
+        <span class="s1-res-label">Max Backscatter (DN)</span>
+        <span class="s1-res-value">${meta.max_value !== undefined ? meta.max_value : "--"}</span>
+      </div>
+      <div class="s1-res-item">
+        <span class="s1-res-label">Mean Backscatter (DN)</span>
+        <span class="s1-res-value">${meta.mean_value !== undefined ? meta.mean_value : "--"}</span>
+      </div>
+      <div class="s1-res-item">
+        <span class="s1-res-label">NoData Value</span>
+        <span class="s1-res-value">${meta.nodata !== undefined ? meta.nodata : "--"}</span>
+      </div>
+      <div class="s1-res-item">
+        <span class="s1-res-label">Output Status</span>
+        <span class="s1-res-value" style="color:#10b981; font-weight:700;">${meta.processing_status || "COMPLETED"}</span>
+      </div>
+      <div class="s1-res-item" style="grid-column: 1 / -1;">
+        <span class="s1-res-label">Processed GeoTIFF</span>
+        <span class="s1-res-value" style="font-size:10px; color:#38bdf8;">${meta.output_file || "--"}</span>
+      </div>
+      <div class="s1-res-item" style="grid-column: 1 / -1;">
+        <span class="s1-res-label">Spatial Bounds</span>
+        <span class="s1-res-value" style="font-size:10px;">${boundsStr}</span>
+      </div>
+    </div>
+    <div class="s1-res-disclaimer">
+      Prototype SAR Preprocessing. Radiometric statistics and geospatial raster generated.
+      No flood detection, water classification, or AI prediction applied.
+    </div>
+  `;
 }
 
 async function loadSentinel1Discovery(
@@ -2268,7 +5009,6 @@ async function loadSentinel1Discovery(
 
   if (!container) return;
 
-  // Show loading state
   if (locationNameEl) locationNameEl.textContent = locationName;
   if (productCountEl) productCountEl.textContent = "--";
   if (statusBar) statusBar.style.display = "none";
@@ -2312,6 +5052,8 @@ async function loadSentinel1Discovery(
         <small style="color:#94a3b8;">${detail || err?.message || ""}</small>
       </div>
     `;
+    renderProductDetails(null);
+    renderGlobalProcessingResults(null);
   }
 }
 
@@ -2524,7 +5266,552 @@ function closeCdseModal() {
   cdseModal.style.display = "none";
 }
 
-async function openReportDossier() {
+function buildReportHtml(reportResponse: any): string {
+  const r = reportResponse.report;
+  const loc = r.location;
+  const exec = r.executive_summary;
+  const s1 = r.sentinel1;
+  const proc = r.preprocessing;
+  const flood = r.flood_detection;
+  const risk = r.risk;
+  const overall = r.overall_assessment;
+
+  // ── A. Executive Summary ───────────────────────────────────────────────
+  const execHtml = exec ? `
+    <div class="report-exec-grid">
+      <div class="report-exec-card">
+        <span class="report-exec-label">Location</span>
+        <span class="report-exec-value" style="font-size:13px;">${escapeHtml(loc.name)}</span>
+      </div>
+      <div class="report-exec-card">
+        <span class="report-exec-label">Sentinel-1 Product</span>
+        <span class="report-exec-value" style="font-size:11px;" title="${escapeHtml(exec.sentinel1_product)}">
+          ${exec.sentinel1_product !== "N/A" ? escapeHtml(exec.sentinel1_product.substring(0, 20) + "...") : "N/A"}
+        </span>
+      </div>
+      <div class="report-exec-card">
+        <span class="report-exec-label">Candidate Area</span>
+        <span class="report-exec-value" style="color:#38bdf8;">${escapeHtml(exec.candidate_area_km2)}</span>
+      </div>
+      <div class="report-exec-card">
+        <span class="report-exec-label">Candidate %</span>
+        <span class="report-exec-value" style="color:#38bdf8;">${escapeHtml(exec.candidate_percentage)}</span>
+      </div>
+      <div class="report-exec-card">
+        <span class="report-exec-label">Risk Level</span>
+        <span class="report-exec-value" style="color:${exec.risk_level === 'HIGH' ? '#f87171' : exec.risk_level === 'MEDIUM' ? '#fbbf24' : '#34d399'};">
+          ${escapeHtml(exec.risk_level)}
+        </span>
+      </div>
+      <div class="report-exec-card">
+        <span class="report-exec-label">Prototype Risk Score</span>
+        <span class="report-exec-value">${escapeHtml(exec.risk_score)}</span>
+      </div>
+      <div class="report-exec-card">
+        <span class="report-exec-label">Active Alerts</span>
+        <span class="report-exec-value" style="color:${exec.active_alerts_count > 0 ? '#f87171' : '#34d399'};">
+          ${exec.active_alerts_count}
+        </span>
+      </div>
+    </div>
+  ` : "";
+
+  // ── B. Location Information ────────────────────────────────────────────
+  const locHtml = `
+    <table class="report-table">
+      <tbody>
+        <tr>
+          <th style="width:20%;">Monitored Site</th>
+          <td style="width:30%;"><strong>${escapeHtml(loc.name)}</strong></td>
+          <th style="width:20%;">District / State</th>
+          <td style="width:30%;">${escapeHtml(loc.district)}, ${escapeHtml(loc.state)}</td>
+        </tr>
+        <tr>
+          <th>Geographic Coordinates</th>
+          <td>${loc.latitude.toFixed(4)}° N, ${loc.longitude.toFixed(4)}° E</td>
+          <th>System Location ID</th>
+          <td><code>LOC-${loc.location_id}</code></td>
+        </tr>
+      </tbody>
+    </table>
+  `;
+
+  // ── C. Satellite Observations (SQL Server) ─────────────────────────────
+  const satHtml = r.satellite_observations && r.satellite_observations.length > 0 ? `
+    <table class="report-table">
+      <thead>
+        <tr>
+          <th>Satellite / Sensor</th>
+          <th>Acquisition Date</th>
+          <th>Product Identifier</th>
+          <th>Cloud Cover</th>
+          <th>Source Label</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${r.satellite_observations.map((s: any) => `
+          <tr>
+            <td><strong>${escapeHtml(s.satellite)}</strong> (${escapeHtml(s.sensor)})</td>
+            <td>${escapeHtml(s.acquisition_date)}</td>
+            <td><code style="font-size:10.5px;">${escapeHtml(s.product_id)}</code></td>
+            <td>${s.cloud_cover !== null && s.cloud_cover !== undefined ? s.cloud_cover + "%" : "N/A"}</td>
+            <td><span class="provenance-tag tag-db">DATABASE OBSERVATION</span></td>
+          </tr>
+        `).join("")}
+      </tbody>
+    </table>
+  ` : `<p class="report-empty-notice">No satellite observations available.</p>`;
+
+  // ── D. Sentinel-1 SAR Product ──────────────────────────────────────────
+  const s1Html = s1 ? `
+    <table class="report-table">
+      <tbody>
+        <tr>
+          <th style="width:22%;">Product ID</th>
+          <td colspan="3"><code style="font-size:11px; word-break:break-all;">${escapeHtml(s1.product_id)}</code></td>
+        </tr>
+        <tr>
+          <th>Spacecraft Platform</th>
+          <td><strong>${escapeHtml(s1.platform)}</strong></td>
+          <th>Instrument Mode</th>
+          <td>${escapeHtml(s1.mode)}</td>
+        </tr>
+        <tr>
+          <th>Product Type</th>
+          <td>${escapeHtml(s1.product_type)}</td>
+          <th>Available Polarizations</th>
+          <td>${s1.polarizations.map((p: any) => `<strong>${escapeHtml(p)}</strong>`).join(" / ")}</td>
+        </tr>
+        <tr>
+          <th>Acquisition Datetime</th>
+          <td>${escapeHtml(s1.acquisition_date)}</td>
+          <th>Download Status</th>
+          <td><span class="status-badge badge-active">${escapeHtml(s1.download_status)}</span></td>
+        </tr>
+      </tbody>
+    </table>
+  ` : `<p class="report-empty-notice">No Sentinel-1 product associated or staged for this location.</p>`;
+
+  // ── E. SAR Preprocessing ───────────────────────────────────────────────
+  const procHtml = proc ? `
+    <table class="report-table">
+      <tbody>
+        <tr>
+          <th style="width:22%;">Processing Status</th>
+          <td style="width:28%;"><span class="status-badge badge-active">${escapeHtml(proc.status)}</span></td>
+          <th style="width:22%;">Polarization / Channel</th>
+          <td style="width:28%;"><strong>${escapeHtml(proc.polarization)}</strong> (${(proc.polarizations_available || []).join(", ")})</td>
+        </tr>
+        <tr>
+          <th>Raster Dimensions</th>
+          <td>${escapeHtml(proc.dimensions)}</td>
+          <th>Coordinate Reference</th>
+          <td><code>${escapeHtml(proc.crs)}</code></td>
+        </tr>
+        <tr>
+          <th>Min / Max Amplitude DN</th>
+          <td>${proc.min_value ?? "N/A"} / ${proc.max_value ?? "N/A"}</td>
+          <th>Mean Backscatter DN</th>
+          <td>${proc.mean_value ? proc.mean_value.toFixed(2) : "N/A"}</td>
+        </tr>
+        <tr>
+          <th>Valid Analyzed Pixels</th>
+          <td>${proc.valid_pixels ? proc.valid_pixels.toLocaleString() : "N/A"}</td>
+          <th>NoData Border Mask</th>
+          <td><code>${proc.nodata ?? -9999}</code></td>
+        </tr>
+        <tr>
+          <th>Processed GeoTIFF Output</th>
+          <td colspan="3"><code style="font-size:10.5px; word-break:break-all;">${escapeHtml(proc.output_file || "")}</code></td>
+        </tr>
+      </tbody>
+    </table>
+  ` : `<p class="report-empty-notice">SAR preprocessing has not been performed.</p>`;
+
+  // ── F. Prototype Flood Detection ───────────────────────────────────────
+  const floodHtml = flood ? `
+    <table class="report-table">
+      <tbody>
+        <tr>
+          <th style="width:22%;">Processing Method</th>
+          <td style="width:28%;"><strong>${escapeHtml(flood.method)}</strong></td>
+          <th style="width:22%;">Classification Category</th>
+          <td style="width:28%;"><span style="color:#38bdf8; font-weight:600;">${escapeHtml(flood.classification)}</span></td>
+        </tr>
+        <tr>
+          <th>Polarization Used</th>
+          <td><strong>${escapeHtml(flood.polarization)}</strong> (${(flood.polarizations_available || []).join(", ")})</td>
+          <th>Backscatter DN Threshold</th>
+          <td><strong>${flood.threshold_used ?? flood.threshold} DN</strong></td>
+        </tr>
+        <tr>
+          <th>Candidate Flood Area</th>
+          <td style="font-size:14px; font-weight:700; color:#38bdf8;">
+            ${flood.detected_area_km2 !== null && flood.detected_area_km2 !== undefined ? flood.detected_area_km2.toFixed(4) + " km²" : "N/A"}
+            <small style="font-size:11px; color:#94a3b8; font-weight:normal;">(${flood.detected_area_m2 ? flood.detected_area_m2.toLocaleString() + " m²" : ""})</small>
+          </td>
+          <th>Candidate Extent %</th>
+          <td style="font-size:14px; font-weight:700; color:#38bdf8;">
+            ${flood.flood_percentage !== null && flood.flood_percentage !== undefined ? flood.flood_percentage.toFixed(2) + "%" : "N/A"}
+          </td>
+        </tr>
+        <tr>
+          <th>Candidate Pixels</th>
+          <td><strong>${flood.candidate_pixels ? flood.candidate_pixels.toLocaleString() : "N/A"}</strong></td>
+          <th>Valid Analyzed Pixels</th>
+          <td>${flood.valid_pixels ? flood.valid_pixels.toLocaleString() : "N/A"}</td>
+        </tr>
+        <tr>
+          <th>Total Analyzed Area</th>
+          <td>${flood.analyzed_area_km2 ? flood.analyzed_area_km2.toFixed(2) + " km²" : "N/A"}</td>
+          <th>Geodesic Area Calculation</th>
+          <td><code>${escapeHtml(flood.area_calculation_method || "WGS-84 Ellipsoidal")}</code></td>
+        </tr>
+        <tr>
+          <th>Flood Mask GeoTIFF</th>
+          <td colspan="3"><code style="font-size:10.5px; word-break:break-all;">${escapeHtml(flood.output_file || "")}</code></td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="report-disclaimer-box">
+      <strong>⚠️ Scientific Disclaimer:</strong> Candidate area represents low-backscatter pixels identified by the prototype threshold method and should not be interpreted as confirmed flood extent. Flood detection is a prototype threshold-based SAR analysis and has not been scientifically validated against ground truth.
+    </div>
+  ` : `<p class="report-empty-notice">No flood detection has been performed.</p>`;
+
+  // ── G. Risk Assessment ─────────────────────────────────────────────────
+  const riskHtml = risk ? `
+    <table class="report-table">
+      <tbody>
+        <tr>
+          <th style="width:22%;">Risk Level</th>
+          <td style="width:28%;">
+            <span class="status-badge ${risk.risk_level === 'HIGH' ? 'badge-high-threat' : risk.risk_level === 'MEDIUM' ? 'badge-moderate-threat' : 'badge-low-threat'}">
+              ${escapeHtml(risk.risk_level)}
+            </span>
+          </td>
+          <th style="width:22%;">Prototype Risk Score</th>
+          <td style="width:28%; font-size:14px; font-weight:700;">
+            ${risk.risk_score !== null && risk.risk_score !== undefined ? Math.round(risk.risk_score * 100) + "%" : "N/A"}
+          </td>
+        </tr>
+        <tr>
+          <th>Rainfall / Accumulated</th>
+          <td>${risk.rainfall_mm ?? "N/A"} mm / ${risk.accumulated_rainfall_mm ?? "N/A"} mm</td>
+          <th>River Proximity</th>
+          <td>${risk.river_distance_km !== null ? risk.river_distance_km + " km" : "N/A"}</td>
+        </tr>
+        <tr>
+          <th>Elevation / Slope</th>
+          <td>${risk.elevation_m ?? "N/A"} m / ${risk.slope_degree ?? "N/A"}°</td>
+          <th>NDVI / NDWI Index</th>
+          <td>${risk.ndvi ?? "N/A"} / ${risk.ndwi ?? "N/A"}</td>
+        </tr>
+        <tr>
+          <th>Historical Frequency</th>
+          <td>${risk.historical_flood_frequency ?? "N/A"} events</td>
+          <th>Previous Inundation Area</th>
+          <td>${risk.previous_flooded_area_km2 !== null ? risk.previous_flooded_area_km2 + " km²" : "N/A"}</td>
+        </tr>
+        <tr>
+          <th>Predictive Model Name</th>
+          <td colspan="3">${escapeHtml(risk.model_name || "Prototype Hydro-Meteorological Model")} (Date: ${escapeHtml(risk.prediction_date || "N/A")})</td>
+        </tr>
+      </tbody>
+    </table>
+    <p style="margin:4px 0 0; font-size:11px; color:#64748b;">
+      Note: Prototype Risk Score is an experimental predictive model and is not a scientifically certified meteorological probability.
+    </p>
+  ` : `<p class="report-empty-notice">No risk prediction available.</p>`;
+
+  // ── H. Historical Flood Context ────────────────────────────────────────
+  const histHtml = r.historical_floods && r.historical_floods.length > 0 ? `
+    <table class="report-table">
+      <thead>
+        <tr>
+          <th>Year</th>
+          <th>Event Date</th>
+          <th>Flooded Area</th>
+          <th>Severity</th>
+          <th>Rainfall</th>
+          <th>Duration</th>
+          <th>Source Authority</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${r.historical_floods.map((h: any) => `
+          <tr>
+            <td><strong>Year ${h.flood_year}</strong></td>
+            <td>${escapeHtml(h.flood_date)}</td>
+            <td><strong>${h.flooded_area_km2 !== null ? h.flooded_area_km2 + " km²" : "N/A"}</strong></td>
+            <td>${escapeHtml(h.severity)}</td>
+            <td>${h.rainfall_mm !== null ? h.rainfall_mm + " mm" : "N/A"}</td>
+            <td>${h.duration_days !== null ? h.duration_days + " days" : "N/A"}</td>
+            <td>${escapeHtml(h.source)}</td>
+          </tr>
+          ${h.description ? `
+            <tr>
+              <td colspan="7" style="font-size:11px; color:#94a3b8; font-style:italic; padding:4px 10px;">
+                Notes: ${escapeHtml(h.description)}
+              </td>
+            </tr>
+          ` : ""}
+        `).join("")}
+      </tbody>
+    </table>
+  ` : `<p class="report-empty-notice">No historical flood records available.</p>`;
+
+  // ── I. Active Alerts ───────────────────────────────────────────────────
+  const alertsHtml = r.alerts && r.alerts.length > 0 ? `
+    <table class="report-table">
+      <thead>
+        <tr>
+          <th>Alert Level</th>
+          <th>Alert Type</th>
+          <th>Advisory Message</th>
+          <th>Issued Datetime</th>
+          <th>Resolution Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${r.alerts.map((a: any) => `
+          <tr>
+            <td>
+              <span class="status-badge ${a.alert_level === 'HIGH' ? 'badge-high-threat' : a.alert_level === 'MEDIUM' ? 'badge-moderate-threat' : 'badge-low-threat'}">
+                ${escapeHtml(a.alert_level)}
+              </span>
+            </td>
+            <td><strong>${escapeHtml(a.alert_type)}</strong></td>
+            <td>${escapeHtml(a.alert_message)}</td>
+            <td>${escapeHtml(a.alert_date)}</td>
+            <td><span class="status-badge ${a.is_resolved ? 'badge-low-threat' : 'badge-high-threat'}">${a.is_resolved ? "RESOLVED" : "ACTIVE"}</span></td>
+          </tr>
+        `).join("")}
+      </tbody>
+    </table>
+  ` : `<p class="report-empty-notice">No active alerts for this location.</p>`;
+
+  // ── J. Overall Assessment ──────────────────────────────────────────────
+  const assessCategoryBadgeClass =
+    overall?.category === "HIGH_CONVERGENCE_CONCERN" ? "badge-high-threat" :
+    overall?.category === "PREDICTIVE_RISK_WARNING" ? "badge-moderate-threat" :
+    overall?.category === "LOCALIZED_CANDIDATE_ANOMALIES" ? "badge-moderate-threat" : "badge-low-threat";
+
+  const overallHtml = overall ? `
+    <div class="report-assessment-box">
+      <span class="report-assessment-badge ${assessCategoryBadgeClass}">
+        ${escapeHtml(overall.category.replace(/_/g, " "))}
+      </span>
+      <p style="font-size:13px; font-weight:600; color:#f8fafc; margin:4px 0 10px;">
+        ${escapeHtml(overall.statement)}
+      </p>
+      <div style="font-size:12px; color:#cbd5e1; line-height:1.6;">
+        <strong>Evidence Summary:</strong>
+        <ul style="margin:6px 0 0 16px; padding:0;">
+          ${(overall.evidence_summary || []).map((item: any) => `<li>${escapeHtml(item)}</li>`).join("")}
+        </ul>
+      </div>
+    </div>
+  ` : `<p class="report-empty-notice">Assessment not available.</p>`;
+
+  // ── K. Methodology ─────────────────────────────────────────────────────
+  const methodHtml = (r.methodology || []).length > 0 ? `
+    <div style="display:flex; flex-direction:column; gap:8px;">
+      ${(r.methodology || []).map((m: any) => `
+        <div class="methodology-step">
+          <span class="methodology-num">${m.step}</span>
+          <div>
+            <strong style="color:#e2e8f0;">${escapeHtml(m.name)}:</strong>
+            <span style="color:#94a3b8;"> ${escapeHtml(m.description)}</span>
+          </div>
+        </div>
+      `).join("")}
+    </div>
+  ` : "";
+
+  // ── L. Scientific Limitations ──────────────────────────────────────────
+  const limitHtml = (r.limitations || []).length > 0 ? `
+    <ul style="margin:0 0 0 18px; padding:0; font-size:12px; color:#cbd5e1; line-height:1.6;">
+      ${(r.limitations || []).map((lim: any) => `<li>${escapeHtml(lim)}</li>`).join("")}
+    </ul>
+  ` : "";
+
+  // ── M. Data Provenance ─────────────────────────────────────────────────
+  const provSources = r.provenance_sources || r.data_provenance || {};
+  const provHtml = `
+    <table class="report-table">
+      <tbody>
+        ${Object.entries(provSources).map(([k, v]) => `
+          <tr>
+            <th style="width:28%; text-transform:capitalize;">${escapeHtml(k.replace(/_/g, " "))}</th>
+            <td>${escapeHtml(String(v))}</td>
+          </tr>
+        `).join("")}
+      </tbody>
+    </table>
+  `;
+
+  return `
+    <div class="report-doc">
+      <!-- HEADER BANNER -->
+      <div class="report-header-banner">
+        <div>
+          <h2 style="margin:0 0 4px; font-size:22px; color:#38bdf8; font-weight:800; letter-spacing:0.5px;">EARTHWATCH AI</h2>
+          <h3 style="margin:0 0 6px; font-size:16px; color:#f8fafc; font-weight:700;">DISASTER ASSESSMENT REPORT</h3>
+          <p style="margin:0; font-size:13px; color:#cbd5e1;">
+            Monitored Site: <strong>${escapeHtml(loc.name)}</strong> • 
+            District: <strong>${escapeHtml(loc.district)}</strong> • 
+            State: <strong>${escapeHtml(loc.state)}</strong>
+          </p>
+          <p style="margin:3px 0 0; font-size:12px; color:#94a3b8;">
+            Coordinates: <strong>${loc.latitude.toFixed(4)}° N, ${loc.longitude.toFixed(4)}° E</strong> | 
+            Report ID: <code>EWA-${loc.location_id}-${new Date(r.generated_at).getTime()}</code>
+          </p>
+        </div>
+        <div style="text-align:right;">
+          <div style="display:flex; flex-direction:column; gap:4px; align-items:flex-end;">
+            <span class="provenance-tag tag-db">SQL SERVER ARCHIVE</span>
+            <span class="provenance-tag tag-stac">COPERNICUS SAR</span>
+            <span class="provenance-tag tag-live" style="background:rgba(245,158,11,0.2); color:#fbbf24; border-color:rgba(245,158,11,0.4);">PROTOTYPE ANALYSIS</span>
+          </div>
+          <small style="font-size:11px; color:#64748b; display:block; margin-top:6px;">Generated: ${escapeHtml(r.generated_at)}</small>
+        </div>
+      </div>
+
+      <!-- SECTION A: EXECUTIVE SUMMARY -->
+      <div class="report-section">
+        <h4>A. EXECUTIVE SUMMARY</h4>
+        ${execHtml}
+      </div>
+
+      <!-- SECTION B: LOCATION INFORMATION -->
+      <div class="report-section">
+        <h4>B. LOCATION INFORMATION</h4>
+        ${locHtml}
+      </div>
+
+      <!-- SECTION C: SATELLITE OBSERVATIONS -->
+      <div class="report-section">
+        <h4>C. SATELLITE OBSERVATIONS (DATABASE TELEMETRY)</h4>
+        ${satHtml}
+      </div>
+
+      <!-- SECTION D: SENTINEL-1 SAR PRODUCT -->
+      <div class="report-section">
+        <h4>D. SENTINEL-1 SAR PRODUCT</h4>
+        ${s1Html}
+      </div>
+
+      <!-- SECTION E: SAR PREPROCESSING -->
+      <div class="report-section">
+        <h4>E. SAR PREPROCESSING (FLOAT32 DN CONVERSION)</h4>
+        ${procHtml}
+      </div>
+
+      <!-- SECTION F: PROTOTYPE FLOOD DETECTION -->
+      <div class="report-section">
+        <h4>F. PROTOTYPE FLOOD DETECTION (LOW-BACKSCATTER CANDIDATE MASK)</h4>
+        ${floodHtml}
+      </div>
+
+      <!-- SECTION G: RISK ASSESSMENT -->
+      <div class="report-section">
+        <h4>G. HYDROLOGICAL RISK ASSESSMENT</h4>
+        ${riskHtml}
+      </div>
+
+      <!-- SECTION H: HISTORICAL FLOOD CONTEXT -->
+      <div class="report-section">
+        <h4>H. HISTORICAL FLOOD CONTEXT</h4>
+        ${histHtml}
+      </div>
+
+      <!-- SECTION I: ACTIVE WARNING ALERTS -->
+      <div class="report-section">
+        <h4>I. ACTIVE WARNING ALERTS</h4>
+        ${alertsHtml}
+      </div>
+
+      <!-- SECTION J: OVERALL ASSESSMENT -->
+      <div class="report-section">
+        <h4>J. OVERALL ASSESSMENT (EVIDENCE SYNTHESIS)</h4>
+        ${overallHtml}
+      </div>
+
+      <!-- SECTION K: METHODOLOGY -->
+      <div class="report-section">
+        <h4>K. PIPELINE METHODOLOGY</h4>
+        ${methodHtml}
+      </div>
+
+      <!-- SECTION L: LIMITATIONS & DISCLAIMERS -->
+      <div class="report-section">
+        <h4>L. SCIENTIFIC LIMITATIONS & HONESTY DISCLOSURES</h4>
+        ${limitHtml}
+      </div>
+
+      <!-- SECTION M: DATA PROVENANCE -->
+      <div class="report-section">
+        <h4>M. DATA PROVENANCE & ATTRIBUTION</h4>
+        ${provHtml}
+      </div>
+    </div>
+  `;
+}
+
+async function loadPageReport(locationId: number, productId?: string | null) {
+  if (!pageReportContent) return;
+
+  pageReportContent.innerHTML = `
+    <div class="state-box">
+      <div class="state-loading">
+        <div class="spinner"></div>
+        <span>Compiling structured disaster assessment report from database...</span>
+      </div>
+    </div>
+  `;
+
+  try {
+    const reportResponse = await fetchReportSummary(locationId, productId);
+    pageReportContent.innerHTML = buildReportHtml(reportResponse);
+
+    const s1 = reportResponse.report.sentinel1;
+    const proc = reportResponse.report.preprocessing;
+    const flood = reportResponse.report.flood_detection;
+
+    updateWorkflowStepper({
+      discoverDone: true,
+      downloadDone: Boolean(s1),
+      preprocessDone: Boolean(proc),
+      floodDone: Boolean(flood),
+      reportDone: true,
+    });
+
+    updateProcessingTimeline({
+      validated: true,
+      downloaded: Boolean(s1),
+      preprocessed: Boolean(proc),
+      floodDetected: Boolean(flood),
+      reportGenerated: true,
+      badge: "REPORT READY",
+    });
+  } catch (err: any) {
+    let errorMsg = "Unable to generate disaster assessment report.";
+    if (err?.response?.status === 404) {
+      errorMsg = "Location not found.";
+    } else if (!err?.response && (err?.code === "ERR_NETWORK" || err?.message?.includes("Network Error"))) {
+      errorMsg = "Unable to connect to EarthWatch AI backend.";
+    }
+
+    pageReportContent.innerHTML = `
+      <div class="state-box" style="color:#ef4444; padding:28px 20px;">
+        <div style="font-size:16px; font-weight:700; margin-bottom:6px;">${errorMsg}</div>
+        <small style="color:#94a3b8;">${err?.response?.data?.detail || err?.message || ""}</small>
+      </div>
+    `;
+  }
+}
+
+export async function openReportDossier() {
   if (!reportModal || !reportModalContent) return;
 
   reportModal.style.display = "flex";
@@ -2538,186 +5825,30 @@ async function openReportDossier() {
   `;
 
   try {
-    const reportResponse = await fetchReportSummary(selectedLocationId);
-    const r = reportResponse.report;
-    const loc = r.location;
+    const reportResponse = await fetchReportSummary(selectedLocationId, selectedSentinel1Product?.product_id);
+    reportModalContent.innerHTML = buildReportHtml(reportResponse);
 
-    // 1. Satellite Observations
-    const satHtml =
-      r.satellite_observations && r.satellite_observations.length > 0
-        ? r.satellite_observations
-            .map(
-              (s) =>
-                `<div class="report-item">` +
-                `• <strong>${escapeHtml(s.satellite)}</strong> (${escapeHtml(s.sensor)}) | ` +
-                `Acquisition: ${escapeHtml(s.acquisition_date)} | Product ID: <code>${escapeHtml(s.product_id)}</code> | ` +
-                `Cloud Cover: ${s.cloud_cover !== null && s.cloud_cover !== undefined ? s.cloud_cover + "%" : "N/A"} | ` +
-                `Source: ${escapeHtml(s.data_source)}` +
-                `</div>`
-            )
-            .join("")
-        : `<p class="report-empty-text">No records available for this location.</p>`;
+    const s1 = reportResponse.report.sentinel1;
+    const proc = reportResponse.report.preprocessing;
+    const flood = reportResponse.report.flood_detection;
 
-    // 2. Flood Detection
-    const floodHtml =
-      r.flood_detections && r.flood_detections.length > 0
-        ? r.flood_detections
-            .map(
-              (f) =>
-                `<div class="report-item">` +
-                `• Status: <strong>${escapeHtml(f.status)}</strong> | ` +
-                `Flooded Area: <strong>${f.flooded_area_km2 !== null && f.flooded_area_km2 !== undefined ? f.flooded_area_km2 + " km²" : "N/A"}</strong> | ` +
-                `Flood Percentage: ${f.flood_percentage !== null && f.flood_percentage !== undefined ? f.flood_percentage + "%" : "N/A"} | ` +
-                `Confidence: ${f.confidence !== null && f.confidence !== undefined ? Math.round(f.confidence * 100) + "%" : "N/A"} | ` +
-                `Method: ${escapeHtml(f.detection_method)} | Source: ${escapeHtml(f.source)} | Date: ${escapeHtml(f.detection_date)}` +
-                `</div>`
-            )
-            .join("")
-        : `<p class="report-empty-text">No records available for this location.</p>`;
+    updateWorkflowStepper({
+      discoverDone: true,
+      downloadDone: Boolean(s1),
+      preprocessDone: Boolean(proc),
+      floodDone: Boolean(flood),
+      reportDone: true,
+    });
 
-    // 3. Flood Regions (Affected Regions)
-    const regionsHtml =
-      r.flood_regions && r.flood_regions.length > 0
-        ? r.flood_regions
-            .map(
-              (reg) =>
-                `<div class="report-item">` +
-                `• <strong>${escapeHtml(reg.region_name)}</strong> (${escapeHtml(reg.district)}) | ` +
-                `Affected Area: <strong>${reg.affected_area_km2 !== null && reg.affected_area_km2 !== undefined ? reg.affected_area_km2 + " km²" : "N/A"}</strong> | ` +
-                `Severity: <strong>${escapeHtml(reg.severity)}</strong> | ` +
-                `Population Affected: ${reg.population_affected !== null && reg.population_affected !== undefined ? Number(reg.population_affected).toLocaleString() : "N/A"}` +
-                `</div>`
-            )
-            .join("")
-        : `<p class="report-empty-text">No records available for this location.</p>`;
+    updateProcessingTimeline({
+      validated: true,
+      downloaded: Boolean(s1),
+      preprocessed: Boolean(proc),
+      floodDetected: Boolean(flood),
+      reportGenerated: true,
+      badge: "REPORT READY",
+    });
 
-    // 4. Risk Assessment
-    const riskHtml =
-      r.risk_predictions && r.risk_predictions.length > 0
-        ? r.risk_predictions
-            .map(
-              (rp) =>
-                `<div class="report-item">` +
-                `• Risk Level: <strong>${escapeHtml(rp.risk_level)}</strong> | ` +
-                `Prototype Risk Score: <strong>${rp.risk_score !== null && rp.risk_score !== undefined ? Math.round(rp.risk_score * 100) + "%" : "N/A"}</strong> | ` +
-                `Model: ${escapeHtml(rp.model_name)} | Date: ${escapeHtml(rp.prediction_date)}<br>` +
-                `&nbsp;&nbsp;Rainfall: ${rp.rainfall_mm !== null && rp.rainfall_mm !== undefined ? rp.rainfall_mm + " mm" : "N/A"} | ` +
-                `Accumulated: ${rp.accumulated_rainfall_mm !== null && rp.accumulated_rainfall_mm !== undefined ? rp.accumulated_rainfall_mm + " mm" : "N/A"} | ` +
-                `Temperature: ${rp.temperature_c !== null && rp.temperature_c !== undefined ? rp.temperature_c + "°C" : "N/A"} | ` +
-                `Elevation: ${rp.elevation_m !== null && rp.elevation_m !== undefined ? rp.elevation_m + " m" : "N/A"} | ` +
-                `Slope: ${rp.slope_degree !== null && rp.slope_degree !== undefined ? rp.slope_degree + "°" : "N/A"} | ` +
-                `River Distance: ${rp.river_distance_km !== null && rp.river_distance_km !== undefined ? rp.river_distance_km + " km" : "N/A"}<br>` +
-                `&nbsp;&nbsp;NDVI: ${rp.ndvi !== null && rp.ndvi !== undefined ? rp.ndvi : "N/A"} | ` +
-                `NDWI: ${rp.ndwi !== null && rp.ndwi !== undefined ? rp.ndwi : "N/A"} | ` +
-                `Historical Flood Frequency: ${rp.historical_flood_frequency !== null && rp.historical_flood_frequency !== undefined ? rp.historical_flood_frequency : "N/A"} | ` +
-                `Previous Flooded Area: ${rp.previous_flooded_area_km2 !== null && rp.previous_flooded_area_km2 !== undefined ? rp.previous_flooded_area_km2 + " km²" : "N/A"}` +
-                `</div>`
-            )
-            .join("")
-        : `<p class="report-empty-text">No records available for this location.</p>`;
-
-    // 5. Historical Floods
-    const historyHtml =
-      r.historical_floods && r.historical_floods.length > 0
-        ? r.historical_floods
-            .map(
-              (h) =>
-                `<div class="report-item">` +
-                `• <strong>Year ${h.flood_year}</strong> (${escapeHtml(h.flood_date)}) | ` +
-                `Flooded Area: <strong>${h.flooded_area_km2 !== null && h.flooded_area_km2 !== undefined ? h.flooded_area_km2 + " km²" : "N/A"}</strong> | ` +
-                `Severity: <strong>${escapeHtml(h.severity)}</strong> | ` +
-                `Rainfall: ${h.rainfall_mm !== null && h.rainfall_mm !== undefined ? h.rainfall_mm + " mm" : "N/A"} | ` +
-                `Duration: ${h.duration_days !== null && h.duration_days !== undefined ? h.duration_days + " days" : "N/A"} | ` +
-                `Source: ${escapeHtml(h.source)}<br>` +
-                (h.description ? `&nbsp;&nbsp;<em>${escapeHtml(h.description)}</em>` : "") +
-                `</div>`
-            )
-            .join("")
-        : `<p class="report-empty-text">No records available for this location.</p>`;
-
-    // 6. Alerts
-    const alertsHtml =
-      r.alerts && r.alerts.length > 0
-        ? r.alerts
-            .map(
-              (a) =>
-                `<div class="report-item">` +
-                `• [${escapeHtml(a.alert_level)} • ${escapeHtml(a.alert_type)}] ` +
-                `<strong>${escapeHtml(a.alert_message)}</strong> | ` +
-                `Date: ${escapeHtml(a.alert_date)} | Status: <strong>${a.is_resolved ? "RESOLVED" : "ACTIVE"}</strong>` +
-                `</div>`
-            )
-            .join("")
-        : `<p class="report-empty-text">No records available for this location.</p>`;
-
-    // Render Clean Comprehensive Document
-    reportModalContent.innerHTML = `
-      <div class="report-doc">
-        <div class="report-header-banner">
-          <div>
-            <h2 style="margin:0 0 4px; font-size:22px; color:#38bdf8; font-weight:800; letter-spacing:0.5px;">EARTHWATCH AI</h2>
-            <h3 style="margin:0 0 6px; font-size:16px; color:#f8fafc; font-weight:700;">DISASTER ASSESSMENT REPORT</h3>
-            <p style="margin:0; font-size:13px; color:#94a3b8;">
-              Location: <strong>${escapeHtml(loc.name)}</strong> | 
-              District: <strong>${escapeHtml(loc.district)}</strong> | 
-              State: <strong>${escapeHtml(loc.state)}</strong>
-            </p>
-            <p style="margin:2px 0 0; font-size:12px; color:#64748b;">
-              Coordinates: <strong>${loc.latitude}° N, ${loc.longitude}° E</strong>
-            </p>
-          </div>
-          <div style="text-align:right;">
-            <span class="provenance-tag tag-db">SQL DATABASE</span><br>
-            <small style="font-size:11px; color:#64748b;">Generated: ${escapeHtml(r.generated_at)}</small>
-          </div>
-        </div>
-
-        <div class="report-section">
-          <h4>SATELLITE OBSERVATIONS</h4>
-          ${satHtml}
-        </div>
-
-        <div class="report-section">
-          <h4>FLOOD DETECTION</h4>
-          ${floodHtml}
-        </div>
-
-        <div class="report-section">
-          <h4>AFFECTED REGIONS</h4>
-          ${regionsHtml}
-        </div>
-
-        <div class="report-section">
-          <h4>RISK ASSESSMENT</h4>
-          ${riskHtml}
-          <p style="margin:6px 0 0; font-size:11px; color:#64748b;">
-            Note: Prototype Risk Score is an experimental predictive model and is not a scientifically certified meteorological probability.
-          </p>
-        </div>
-
-        <div class="report-section">
-          <h4>HISTORICAL FLOODS</h4>
-          ${historyHtml}
-        </div>
-
-        <div class="report-section">
-          <h4>ALERTS</h4>
-          ${alertsHtml}
-        </div>
-
-        <div class="report-section" style="border-top:1px solid #1e3a56; padding-top:14px; margin-bottom:0;">
-          <h4>DATA SOURCES</h4>
-          <p style="font-size:12px; color:#94a3b8; margin:0 0 4px; line-height:1.5;">
-            • <strong>Database Records:</strong> ${escapeHtml(r.data_provenance.database)}<br>
-            • <strong>Satellite Discovery:</strong> ${escapeHtml(r.data_provenance.satellite)}<br>
-            • <strong>Risk Model:</strong> ${escapeHtml(r.data_provenance.risk_model)}
-          </p>
-          <p style="font-size:11px; color:#64748b; margin:4px 0 0;">
-            Data provenance notice: Database records reflect archived telemetry and historical events stored within EarthWatchAI SQL Server.
-          </p>
-        </div>
-      </div>
-    `;
   } catch (err: any) {
     let errorMsg = "Unable to generate disaster assessment report.";
     if (err?.response?.status === 404) {
@@ -3024,37 +6155,103 @@ locationInput?.addEventListener("keydown", (e) => {
 
 // Quick Action Buttons
 detectFloodButton?.addEventListener("click", () => {
-  selectMonitoredLocation(selectedLocationName);
-  const mapSec = document.querySelector(".map-section");
-  mapSec?.scrollIntoView({ behavior: "smooth" });
+  switchView("flood-detection");
 });
 
 compareButton?.addEventListener("click", () => {
-  const compSec = document.querySelector("#comparison-section");
-  compSec?.scrollIntoView({ behavior: "smooth" });
+  switchView("compare");
 });
 
 riskButton?.addEventListener("click", () => {
-  const riskSec = document.querySelector("#risk-section");
-  riskSec?.scrollIntoView({ behavior: "smooth" });
+  switchView("risk");
 });
 
 historyButton?.addEventListener("click", () => {
-  const histSec = document.querySelector("#history-section");
-  histSec?.scrollIntoView({ behavior: "smooth" });
+  switchView("historical-floods");
 });
 
 alertsButton?.addEventListener("click", () => {
-  const alertSec = document.querySelector("#alert-center-section");
-  alertSec?.scrollIntoView({ behavior: "smooth" });
+  switchView("alerts");
 });
 
-reportActionBtn?.addEventListener("click", openReportDossier);
-generateReportBtn?.addEventListener("click", openReportDossier);
+reportActionBtn?.addEventListener("click", () => {
+  switchView("report");
+});
+generateReportBtn?.addEventListener("click", () => {
+  switchView("report");
+});
 
 closeReportBtn?.addEventListener("click", () => {
   if (reportModal) reportModal.style.display = "none";
 });
+
+reportModal?.addEventListener("click", (e) => {
+  if (e.target === reportModal) {
+    reportModal.style.display = "none";
+  }
+});
+
+// Step 5 & Timeline Node click handlers to open Report
+document.querySelector<HTMLElement>("#step-5-report")?.addEventListener("click", () => {
+  switchView("report");
+});
+document.querySelector<HTMLElement>("#tl-node-report")?.addEventListener("click", () => {
+  switchView("report");
+});
+
+// Stepper Step 1, 2, 3 navigation handlers
+document.querySelector<HTMLElement>("#step-1-discover")?.addEventListener("click", () => {
+  switchView("satellite");
+});
+document.querySelector<HTMLElement>("#step-2-download")?.addEventListener("click", () => {
+  if (selectedSentinel1Product) {
+    openSentinel1DownloadModal(selectedSentinel1Product);
+  } else {
+    switchView("satellite");
+  }
+});
+document.querySelector<HTMLElement>("#step-3-preprocess")?.addEventListener("click", () => {
+  if (selectedSentinel1Product) {
+    openSarProcessingModal(selectedSentinel1Product, selectedSentinel1SarStatus);
+  } else {
+    switchView("satellite");
+  }
+});
+
+// Flood control bar buttons
+floodCtrlPreprocessBtn?.addEventListener("click", () => {
+  if (selectedSentinel1Product) {
+    openSarProcessingModal(selectedSentinel1Product, selectedSentinel1SarStatus);
+  } else {
+    alert("Please select a Sentinel-1 product first from the Satellite section.");
+    switchView("satellite");
+  }
+});
+floodCtrlDetectBtn?.addEventListener("click", () => {
+  if (selectedSentinel1Product) {
+    if (selectedSentinel1SarStatus?.processed_polarizations?.length) {
+      openFloodDetectionModal(selectedSentinel1Product, "VV");
+    } else {
+      alert("Product must be preprocessed first. Opening SAR preprocessing...");
+      openSarProcessingModal(selectedSentinel1Product, selectedSentinel1SarStatus);
+    }
+  } else {
+    alert("Please select a Sentinel-1 product first from the Satellite section.");
+    switchView("satellite");
+  }
+});
+floodCtrlReportBtn?.addEventListener("click", () => {
+  switchView("report");
+});
+
+// In-Page Report page buttons
+pagePrintReportBtn?.addEventListener("click", () => {
+  window.print();
+});
+pageRefreshReportBtn?.addEventListener("click", () => {
+  loadPageReport(selectedLocationId, selectedSentinel1Product?.product_id);
+});
+
 
 // Copernicus Data Space Listeners
 openCdseBtn?.addEventListener("click", openCdseModal);
@@ -3194,11 +6391,273 @@ document.querySelector<HTMLButtonElement>("#s1-refresh-btn")?.addEventListener("
 // BOOTSTRAP APPLICATION
 // ======================================================
 
+
+// ======================================================
+// VIEW SWITCHER & NAVIGATION LOGIC
+// ======================================================
+
+export type AppView =
+  | "dashboard"
+  | "satellite"
+  | "flood-detection"
+  | "location-observation"
+  | "historical-floods"
+  | "report"
+  | "risk"
+  | "alerts"
+  | "compare"
+  | "users";
+
+export let activeView: AppView = "dashboard";
+
+export function normalizeView(viewName: string): AppView {
+  switch (viewName) {
+    case "dashboard":
+      return "dashboard";
+    case "satellite":
+    case "sentinel1":
+      return "satellite";
+    case "flood-detection":
+    case "floods":
+    case "flood":
+      return "flood-detection";
+    case "location-observation":
+    case "locations":
+    case "observations":
+      return "location-observation";
+    case "historical-floods":
+    case "history":
+      return "historical-floods";
+    case "report":
+    case "reports":
+      return "report";
+    case "risk":
+      return "risk";
+    case "alerts":
+    case "alert":
+      return "alerts";
+    case "compare":
+    case "comparison":
+      return "compare";
+    case "users":
+    case "user-management":
+      return "users";
+    default:
+      return activeView; // DO NOT fall back to dashboard accidentally
+  }
+}
+
+export function renderDashboard() {
+  updateTopStatistics();
+}
+
+export function renderSatellite() {
+  setTimeout(() => {
+    try {
+      map.invalidateSize();
+      if (selectedLatitude && selectedLongitude) {
+        map.setView([selectedLatitude, selectedLongitude], 12);
+      }
+      renderLocationPins(dbLocations, selectedLocationId);
+    } catch (e) {
+      console.warn("Leaflet resize error:", e);
+    }
+  }, 100);
+
+  if (lastLoadedSatelliteLocationId !== selectedLocationId) {
+    lastLoadedSatelliteLocationId = selectedLocationId;
+    loadSentinel1Discovery(selectedLocationId, selectedLocationName).catch(() => {});
+  }
+}
+
+export function renderFloodDetection() {
+  updateFloodDetectionView();
+  if (selectedSentinel1Product) {
+    renderGlobalProcessingResults(
+      selectedSentinel1SarStatus,
+      selectedSentinel1FloodStatus,
+      currentResultsTab
+    );
+  }
+}
+
+export function renderLocationObservation() {
+  updateLocationObservationView();
+}
+
+export function renderHistoricalFloods() {
+  const locHistory = allHistoricalFloods.filter(
+    (h) => h.location_id === selectedLocationId
+  );
+  renderHistoricalCharts(locHistory);
+}
+
+export function renderReport() {
+  loadPageReport(selectedLocationId, selectedSentinel1Product?.product_id);
+}
+
+export function renderRiskView() {
+  // Risk telemetry already populated for selectedLocationId
+}
+
+export function renderAlertsView() {
+  renderAlerts(allAlerts, selectedLocationId);
+}
+
+export function renderCompareView() {
+  if (comparisonLocationSelect) {
+    comparisonLocationSelect.value = selectedLocationName;
+  }
+}
+
+export function renderCurrentView() {
+  // 1. Highlight active sidebar item
+  document.querySelectorAll<HTMLButtonElement>(".nav-item").forEach((btn) => {
+    const view = btn.getAttribute("data-view");
+    if (view && normalizeView(view) === activeView) {
+      btn.classList.add("active");
+    } else {
+      btn.classList.remove("active");
+    }
+  });
+
+  // 2. Show active view panel, hide all other view panels
+  document.querySelectorAll<HTMLElement>(".view-panel").forEach((panel) => {
+    if (panel.id === `view-${activeView}`) {
+      panel.classList.add("active");
+      panel.style.display = "block";
+    } else {
+      panel.classList.remove("active");
+      panel.style.display = "none";
+    }
+  });
+
+  // 3. Render section-specific content
+  switch (activeView) {
+    case "dashboard":
+      renderDashboard();
+      break;
+    case "satellite":
+      renderSatellite();
+      break;
+    case "flood-detection":
+      renderFloodDetection();
+      break;
+    case "location-observation":
+      renderLocationObservation();
+      break;
+    case "historical-floods":
+      renderHistoricalFloods();
+      break;
+    case "report":
+      renderReport();
+      break;
+    case "risk":
+      renderRiskView();
+      break;
+    case "alerts":
+      renderAlertsView();
+      break;
+    case "compare":
+      renderCompareView();
+      break;
+    case "users":
+      renderUserManagement();
+      break;
+    default:
+      console.warn(`Unknown active view: ${activeView}`);
+      break;
+  }
+
+  // Ensure scroll position resets to top on page switch
+  const scrollContainer = document.querySelector<HTMLElement>("#main-content-scroll");
+  if (scrollContainer) {
+    scrollContainer.scrollTop = 0;
+  }
+}
+
+export function switchView(viewName: string) {
+  const nextView = normalizeView(viewName);
+  if (nextView === "users") {
+    const auth = getAuthState();
+    if (!auth.isAuthenticated || auth.currentUser?.role !== "ADMIN") {
+      alert("Access Denied: You do not have permission to access User Management.");
+      return;
+    }
+  }
+  activeView = nextView;
+  if (typeof window !== "undefined") {
+    (window as any).activeView = activeView;
+  }
+  renderCurrentView();
+}
+
+export function showDashboard() { switchView("dashboard"); }
+export function showSatellite() { switchView("satellite"); }
+export function showFloodDetection() { switchView("flood-detection"); }
+export function showLocationObservation() { switchView("location-observation"); }
+export function showHistoricalFloods() { switchView("historical-floods"); }
+export function showReport() { switchView("report"); }
+export function showUsers() { switchView("users"); }
+
+if (typeof window !== "undefined") {
+  (window as any).activeView = activeView;
+  (window as any).switchView = switchView;
+  (window as any).renderCurrentView = renderCurrentView;
+  (window as any).showDashboard = showDashboard;
+  (window as any).showSatellite = showSatellite;
+  (window as any).showFloodDetection = showFloodDetection;
+  (window as any).showLocationObservation = showLocationObservation;
+  (window as any).showHistoricalFloods = showHistoricalFloods;
+  (window as any).showReport = showReport;
+  (window as any).showUsers = showUsers;
+}
+
+// Navigation event bindings
+document.querySelectorAll<HTMLButtonElement>(".nav-item").forEach((btn) => {
+  btn.addEventListener("click", (e) => {
+    e.preventDefault();
+    const view = btn.getAttribute("data-view");
+    if (!view) return;
+
+    if (view === "settings") {
+      openCdseBtn?.click();
+      return;
+    }
+    switchView(view);
+  });
+});
+
+// Location Observation selector change listener
+locObsSelect?.addEventListener("change", (e) => {
+  const val = (e.target as HTMLSelectElement).value;
+  if (val) {
+    selectMonitoredLocation(val);
+  }
+});
+
+// Modal close handlers
+closeSarModalBtn?.addEventListener("click", closeSarProcessingModal);
+sarModalCancelBtn?.addEventListener("click", closeSarProcessingModal);
+closeFloodModalBtn?.addEventListener("click", closeFloodDetectionModal);
+floodModalCancelBtn?.addEventListener("click", closeFloodDetectionModal);
+
+// Stepper Step 4 click handler to open flood detection when ready
+document.querySelector<HTMLElement>("#step-4-detection")?.addEventListener("click", () => {
+  if (selectedSentinel1Product && selectedSentinel1SarStatus?.processed_polarizations?.length) {
+    openFloodDetectionModal(selectedSentinel1Product, "VV");
+  } else if (selectedSentinel1Product) {
+    openSarProcessingModal(selectedSentinel1Product, selectedSentinel1SarStatus);
+  } else {
+    switchView("satellite");
+  }
+});
+
 async function initializeEarthWatch() {
   try {
     // 1. Check Backend Health
     const healthRes = await axios.get(`${BACKEND_URL}/health`);
-    if (healthRes.data?.status === "ok") {
+    if (healthRes.data?.status === "ok" || healthRes.data?.status === "healthy") {
       systemStatusIndicator.textContent = "System Online";
       systemStatusIndicator.style.color = "#10b981";
     }
@@ -3243,6 +6702,15 @@ async function initializeEarthWatch() {
         )
         .join("");
 
+      if (locObsSelect) {
+        locObsSelect.innerHTML = dbLocations
+          .map(
+            (loc) =>
+              `<option value="${loc.location_id}">${loc.location_name} (${loc.district})</option>`
+          )
+          .join("");
+      }
+
       // Comparison section queries specific STAC coordinates by location name
       if (comparisonLocationSelect) {
         comparisonLocationSelect.innerHTML = dbLocations
@@ -3260,24 +6728,42 @@ async function initializeEarthWatch() {
       selectedLatitude = firstLoc.latitude;
       selectedLongitude = firstLoc.longitude;
       dbLocationSelect.value = String(firstLoc.location_id);
+      if (locObsSelect) {
+        locObsSelect.value = String(firstLoc.location_id);
+      }
       if (comparisonLocationSelect) {
         comparisonLocationSelect.value = firstLoc.location_name;
       }
       await selectMonitoredLocation(firstLoc.location_id);
     } else {
       dbLocationSelect.innerHTML = `<option value="">No locations in database</option>`;
+      if (locObsSelect) {
+        locObsSelect.innerHTML = `<option value="">No locations in database</option>`;
+      }
       if (comparisonLocationSelect) {
         comparisonLocationSelect.innerHTML = `<option value="">No locations in database</option>`;
       }
     }
+
+    // Fresh load starts on dashboard (preserve activeView if user navigated during async loading)
+    if (!activeView || activeView === "dashboard") {
+      activeView = "dashboard";
+      renderCurrentView();
+    } else {
+      renderCurrentView();
+    }
+
     // Load SAR pipeline status (non-blocking — fires after main init)
     loadSarPipelineStatus().catch(() => {});
 
-    // Load Sentinel-1 product discovery for initial location (non-blocking)
-    loadSentinel1Discovery(
-      selectedLocationId,
-      selectedLocationName
-    ).catch(() => {});
+    // Only load Sentinel-1 product discovery if on Satellite view
+    if (activeView === "satellite") {
+      lastLoadedSatelliteLocationId = selectedLocationId;
+      loadSentinel1Discovery(
+        selectedLocationId,
+        selectedLocationName
+      ).catch(() => {});
+    }
 
     // Prime Copernicus Data Space authentication status (non-blocking)
     loadCdseStatus().catch(() => {});
@@ -3295,5 +6781,600 @@ async function initializeEarthWatch() {
   }
 }
 
-// Start application
-initializeEarthWatch();
+// ======================================================
+// USER MANAGEMENT IMPLEMENTATION (ADMIN ONLY)
+// ======================================================
+
+export async function renderUserManagement() {
+  const tableBody = document.querySelector<HTMLElement>("#users-table-body");
+  if (!tableBody) return;
+
+  const auth = getAuthState();
+  if (auth.currentUser?.role !== "ADMIN") {
+    tableBody.innerHTML = `
+      <tr>
+        <td colspan="7" style="text-align:center; padding:30px; color:var(--status-error);">
+          🚫 Access Denied: Administrator privileges required to view user management.
+        </td>
+      </tr>
+    `;
+    return;
+  }
+
+  tableBody.innerHTML = `
+    <tr>
+      <td colspan="7" style="text-align:center; padding:30px; color:var(--text-secondary);">
+        Fetching verified user accounts from SQL Server database...
+      </td>
+    </tr>
+  `;
+
+  try {
+    const res = await axios.get(`${BACKEND_URL}/users`);
+    const users = res.data?.users || [];
+
+    // Update Stats
+    const totalEl = document.querySelector<HTMLElement>("#users-stat-total");
+    const adminsEl = document.querySelector<HTMLElement>("#users-stat-admins");
+    const analystsEl = document.querySelector<HTMLElement>("#users-stat-analysts");
+    const activeEl = document.querySelector<HTMLElement>("#users-stat-active");
+    const countTag = document.querySelector<HTMLElement>("#users-count-tag");
+
+    const total = users.length;
+    const admins = users.filter((u: any) => u.role === "ADMIN").length;
+    const analysts = users.filter((u: any) => u.role === "ANALYST").length;
+    const active = users.filter((u: any) => u.is_active).length;
+
+    if (totalEl) totalEl.textContent = String(total);
+    if (adminsEl) adminsEl.textContent = String(admins);
+    if (analystsEl) analystsEl.textContent = String(analysts);
+    if (activeEl) activeEl.textContent = String(active);
+    if (countTag) countTag.textContent = `${total} Users Registered`;
+
+    if (users.length === 0) {
+      tableBody.innerHTML = `
+        <tr>
+          <td colspan="7" style="text-align:center; padding:30px; color:var(--text-secondary);">
+            No users found in database.
+          </td>
+        </tr>
+      `;
+      return;
+    }
+
+    const currentUserId = auth.currentUser?.id;
+
+    tableBody.innerHTML = users
+      .map((u: any) => {
+        const isSelf = u.id === currentUserId;
+        const roleBadge =
+          u.role === "ADMIN"
+            ? `<span class="badge-role admin">🛡️ ADMIN</span>`
+            : `<span class="badge-role analyst">🔬 ANALYST</span>`;
+
+        const statusBadge = u.is_active
+          ? `<span class="badge-status active">Active</span>`
+          : `<span class="badge-status inactive">Inactive</span>`;
+
+        const formattedDate = u.created_at
+          ? new Date(u.created_at).toLocaleDateString(undefined, {
+              year: "numeric",
+              month: "short",
+              day: "numeric",
+              hour: "2-digit",
+              minute: "2-digit",
+            })
+          : "--";
+
+        let actionHtml = "";
+        if (isSelf) {
+          actionHtml = `<span style="font-size:11px; color:var(--text-dim); font-style:italic;">(Current Session)</span>`;
+        } else {
+          const nextStatus = !u.is_active;
+          const btnClass = u.is_active
+            ? "btn-toggle-status deactivate"
+            : "btn-toggle-status activate";
+          const btnText = u.is_active ? "Deactivate" : "Activate";
+          actionHtml = `
+            <button type="button" class="${btnClass}" data-user-id="${u.id}" data-next-status="${nextStatus}">
+              ${btnText}
+            </button>
+          `;
+        }
+
+        return `
+          <tr>
+            <td style="font-family:monospace; color:var(--text-secondary); font-weight:600;">#${u.id}</td>
+            <td><strong style="color:var(--text-main);">${u.name}</strong></td>
+            <td style="font-family:monospace; color:var(--accent-blue);">${u.email}</td>
+            <td>${roleBadge}</td>
+            <td>${statusBadge}</td>
+            <td style="color:var(--text-secondary); font-size:11.5px;">${formattedDate}</td>
+            <td>${actionHtml}</td>
+          </tr>
+        `;
+      })
+      .join("");
+
+    // Bind action buttons
+    tableBody.querySelectorAll<HTMLButtonElement>(".btn-toggle-status").forEach((btn) => {
+      btn.addEventListener("click", async (e) => {
+        e.preventDefault();
+        const userId = btn.getAttribute("data-user-id");
+        const nextStatus = btn.getAttribute("data-next-status") === "true";
+        if (!userId) return;
+
+        const confirmMsg = nextStatus
+          ? "Are you sure you want to activate this user account?"
+          : "Are you sure you want to deactivate this user account? The user will be unable to log in.";
+
+        if (!confirm(confirmMsg)) return;
+
+        btn.disabled = true;
+        btn.textContent = "Updating...";
+        try {
+          await axios.patch(`${BACKEND_URL}/users/${userId}/status`, {
+            is_active: nextStatus,
+          });
+          await renderUserManagement();
+        } catch (err: any) {
+          alert(`Failed to update user status: ${err.response?.data?.detail || "Server error"}`);
+          btn.disabled = false;
+        }
+      });
+    });
+  } catch (err: any) {
+    console.error("Failed loading users list:", err);
+    tableBody.innerHTML = `
+      <tr>
+        <td colspan="7" style="text-align:center; padding:30px; color:var(--status-error);">
+          Failed to load users: ${err.response?.data?.detail || err.message || "Unknown error"}
+        </td>
+      </tr>
+    `;
+  }
+}
+
+// ======================================================
+// AUTHENTICATION STATE & BOOTSTRAP LOGIC
+// ======================================================
+
+let isEarthWatchInitialized = false;
+let spatialLoginController: SpatialLoginController | null = null;
+
+// DOM Elements
+const authLoadingOverlay = document.querySelector<HTMLElement>("#auth-loading-overlay");
+const authContainer = document.querySelector<HTMLElement>("#auth-container");
+const appLayout = document.querySelector<HTMLElement>("#app-layout");
+const authLoginForm = document.querySelector<HTMLFormElement>("#auth-login-form");
+const loginEmail = document.querySelector<HTMLInputElement>("#login-email");
+const loginPassword = document.querySelector<HTMLInputElement>("#login-password");
+const loginRemember = document.querySelector<HTMLInputElement>("#login-remember");
+const loginPasswordToggle = document.querySelector<HTMLButtonElement>("#login-password-toggle");
+const loginForgotBtn = document.querySelector<HTMLButtonElement>("#login-forgot-btn");
+const loginSubmitBtn = document.querySelector<HTMLButtonElement>("#login-submit-btn");
+const loginSubmitText = document.querySelector<HTMLElement>("#login-submit-text");
+const loginEmailError = document.querySelector<HTMLElement>("#login-email-error");
+const loginPasswordError = document.querySelector<HTMLElement>("#login-password-error");
+const authAlertBanner = document.querySelector<HTMLElement>("#auth-alert-banner");
+const authAlertTitle = document.querySelector<HTMLElement>("#auth-alert-title");
+const authAlertMsg = document.querySelector<HTMLElement>("#auth-alert-msg");
+const authSuccessBadge = document.querySelector<HTMLElement>("#auth-success-badge");
+const demoChipAdmin = document.querySelector<HTMLButtonElement>("#demo-chip-admin");
+const demoChipAnalyst = document.querySelector<HTMLButtonElement>("#demo-chip-analyst");
+
+// Topbar user elements
+const topbarUserBadge = document.querySelector<HTMLElement>("#topbar-user-badge");
+const topbarUserAvatar = document.querySelector<HTMLElement>("#topbar-user-avatar");
+const topbarUserName = document.querySelector<HTMLElement>("#topbar-user-name");
+const topbarUserRole = document.querySelector<HTMLElement>("#topbar-user-role");
+const logoutBtn = document.querySelector<HTMLButtonElement>("#logout-btn");
+
+// Admin nav elements
+const navSectionAdmin = document.querySelector<HTMLElement>("#nav-section-admin");
+const navItemUsers = document.querySelector<HTMLElement>("#nav-item-users");
+
+// Add User Modal elements
+const btnOpenAddUser = document.querySelector<HTMLButtonElement>("#btn-open-add-user");
+const btnRefreshUsers = document.querySelector<HTMLButtonElement>("#btn-refresh-users");
+const addUserModal = document.querySelector<HTMLElement>("#add-user-modal");
+const closeAddUserBtn = document.querySelector<HTMLButtonElement>("#close-add-user-btn");
+const cancelAddUserBtn = document.querySelector<HTMLButtonElement>("#cancel-add-user-btn");
+const addUserForm = document.querySelector<HTMLFormElement>("#add-user-form");
+const addUserName = document.querySelector<HTMLInputElement>("#add-user-name");
+const addUserEmail = document.querySelector<HTMLInputElement>("#add-user-email");
+const addUserPassword = document.querySelector<HTMLInputElement>("#add-user-password");
+const addUserRole = document.querySelector<HTMLSelectElement>("#add-user-role");
+const addUserAlert = document.querySelector<HTMLElement>("#add-user-alert");
+const addUserNameError = document.querySelector<HTMLElement>("#add-user-name-error");
+const addUserEmailError = document.querySelector<HTMLElement>("#add-user-email-error");
+const addUserPasswordError = document.querySelector<HTMLElement>("#add-user-password-error");
+
+function showAuthAlert(type: "error" | "warning" | "info", message: string) {
+  if (!authAlertBanner || !authAlertMsg) return;
+  authAlertBanner.className = `auth-alert-banner ${type}`;
+  if (authAlertTitle) {
+    authAlertTitle.textContent =
+      type === "error"
+        ? "AUTHENTICATION FAILED"
+        : type === "warning"
+        ? "SESSION NOTICE"
+        : "SYSTEM INFORMATION";
+  }
+  authAlertMsg.textContent = message;
+  authAlertBanner.style.display = "flex";
+}
+
+function clearAuthAlert() {
+  if (!authAlertBanner) return;
+  authAlertBanner.className = "auth-alert-banner";
+  authAlertBanner.style.display = "none";
+}
+
+function clearValidationErrors() {
+  if (loginEmailError) {
+    loginEmailError.textContent = "";
+    loginEmailError.classList.remove("visible");
+  }
+  if (loginPasswordError) {
+    loginPasswordError.textContent = "";
+    loginPasswordError.classList.remove("visible");
+  }
+  if (loginEmail) loginEmail.classList.remove("has-error");
+  if (loginPassword) loginPassword.classList.remove("has-error");
+}
+
+function getInitials(name: string): string {
+  const parts = name.trim().split(/\s+/);
+  if (parts.length >= 2) {
+    return (parts[0][0] + parts[1][0]).toUpperCase();
+  }
+  return name.slice(0, 2).toUpperCase();
+}
+
+function updateAuthenticatedUI(user: AuthUser) {
+  // Show app layout, hide auth screen & overlay
+  if (authLoadingOverlay) authLoadingOverlay.style.display = "none";
+  if (authContainer) authContainer.style.display = "none";
+  if (appLayout) appLayout.style.display = "flex";
+
+  // Topbar profile
+  if (topbarUserBadge) topbarUserBadge.style.display = "flex";
+  if (logoutBtn) logoutBtn.style.display = "inline-flex";
+  if (topbarUserName) topbarUserName.textContent = user.name;
+  if (topbarUserAvatar) topbarUserAvatar.textContent = getInitials(user.name);
+  if (topbarUserRole) {
+    topbarUserRole.textContent = user.role;
+    topbarUserRole.className = `topbar-user-role ${user.role.toLowerCase()}`;
+  }
+
+  // Sidebar role-based visibility
+  const isAdmin = user.role === "ADMIN";
+  if (navSectionAdmin) navSectionAdmin.style.display = isAdmin ? "block" : "none";
+  if (navItemUsers) navItemUsers.style.display = isAdmin ? "flex" : "none";
+}
+
+async function onLoginSuccess(user: AuthUser) {
+  // Show short visual transition: ✓ ACCESS VERIFIED (450ms)
+  if (authContainer && authContainer.style.display !== "none" && authSuccessBadge) {
+    authSuccessBadge.style.display = "flex";
+    if (loginSubmitBtn) loginSubmitBtn.disabled = true;
+    await new Promise((resolve) => setTimeout(resolve, 450));
+  }
+
+  // Stop background spatial rendering loop when entering dashboard to free 100% resources
+  if (spatialLoginController) {
+    spatialLoginController.stop();
+  }
+
+  updateAuthenticatedUI(user);
+
+  // Initialize application data if not yet initialized
+  if (!isEarthWatchInitialized) {
+    isEarthWatchInitialized = true;
+    await initializeEarthWatch();
+  } else {
+    // If returning from session, render active view
+    renderCurrentView();
+  }
+}
+
+function handleSessionExpired() {
+  if (appLayout) appLayout.style.display = "none";
+  if (authLoadingOverlay) authLoadingOverlay.style.display = "none";
+  if (authContainer) authContainer.style.display = "flex";
+  if (authSuccessBadge) authSuccessBadge.style.display = "none";
+
+  if (spatialLoginController) {
+    spatialLoginController.start();
+  }
+
+  showAuthAlert("warning", "Your session has expired. Please sign in again.");
+}
+
+async function performLogout() {
+  try {
+    await logoutUser(BACKEND_URL);
+  } catch (e) {
+    console.warn("Logout error:", e);
+  }
+
+  if (appLayout) appLayout.style.display = "none";
+  if (topbarUserBadge) topbarUserBadge.style.display = "none";
+  if (logoutBtn) logoutBtn.style.display = "none";
+  if (authContainer) authContainer.style.display = "flex";
+  if (authSuccessBadge) authSuccessBadge.style.display = "none";
+
+  // Re-start 4D spatial motion engine
+  if (spatialLoginController) {
+    spatialLoginController.start();
+  }
+
+  // Clear fields and alert
+  if (loginPassword) loginPassword.value = "";
+  clearValidationErrors();
+  showAuthAlert("info", "You have been logged out successfully.");
+}
+
+// Password toggle handler
+let isPasswordVisible = false;
+loginPasswordToggle?.addEventListener("click", () => {
+  if (!loginPassword) return;
+  isPasswordVisible = !isPasswordVisible;
+  loginPassword.type = isPasswordVisible ? "text" : "password";
+  loginPasswordToggle.textContent = isPasswordVisible ? "🙈" : "👁️";
+});
+
+// Forgot password informational handler
+loginForgotBtn?.addEventListener("click", () => {
+  showAuthAlert(
+    "info",
+    "Self-service password recovery is disabled in this environment. Please contact your system administrator."
+  );
+});
+
+// Demo operator selector chips (prefills operator email; passwords are never hardcoded in source)
+demoChipAdmin?.addEventListener("click", () => {
+  if (loginEmail) loginEmail.value = "admin@earthwatch.ai";
+  if (loginPassword) {
+    loginPassword.value = "";
+    loginPassword.focus();
+  }
+  clearValidationErrors();
+  clearAuthAlert();
+});
+
+demoChipAnalyst?.addEventListener("click", () => {
+  if (loginEmail) loginEmail.value = "analyst@earthwatch.ai";
+  if (loginPassword) {
+    loginPassword.value = "";
+    loginPassword.focus();
+  }
+  clearValidationErrors();
+  clearAuthAlert();
+});
+
+// Real-time input error clearing
+loginEmail?.addEventListener("input", () => {
+  if (loginEmailError) {
+    loginEmailError.textContent = "";
+    loginEmailError.classList.remove("visible");
+  }
+  loginEmail.classList.remove("has-error");
+});
+
+loginPassword?.addEventListener("input", () => {
+  if (loginPasswordError) {
+    loginPasswordError.textContent = "";
+    loginPasswordError.classList.remove("visible");
+  }
+  loginPassword.classList.remove("has-error");
+});
+
+// Login Form Submit handler
+authLoginForm?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  clearValidationErrors();
+  clearAuthAlert();
+
+  const emailVal = loginEmail ? loginEmail.value.trim() : "";
+  const passwordVal = loginPassword ? loginPassword.value : "";
+  const rememberMe = loginRemember ? loginRemember.checked : false;
+
+  let hasError = false;
+
+  // Frontend Email Validation
+  if (!emailVal) {
+    if (loginEmailError) {
+      loginEmailError.textContent = "Email is required.";
+      loginEmailError.classList.add("visible");
+    }
+    if (loginEmail) loginEmail.classList.add("has-error");
+    hasError = true;
+  } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailVal)) {
+    if (loginEmailError) {
+      loginEmailError.textContent = "Enter a valid email address.";
+      loginEmailError.classList.add("visible");
+    }
+    if (loginEmail) loginEmail.classList.add("has-error");
+    hasError = true;
+  }
+
+  // Frontend Password Validation
+  if (!passwordVal) {
+    if (loginPasswordError) {
+      loginPasswordError.textContent = "Password is required.";
+      loginPasswordError.classList.add("visible");
+    }
+    if (loginPassword) loginPassword.classList.add("has-error");
+    hasError = true;
+  } else if (passwordVal.length < 8) {
+    if (loginPasswordError) {
+      loginPasswordError.textContent = "Password must be at least 8 characters.";
+      loginPasswordError.classList.add("visible");
+    }
+    if (loginPassword) loginPassword.classList.add("has-error");
+    hasError = true;
+  }
+
+  if (hasError) return;
+
+  // Set loading state with futuristic scanning label
+  if (loginSubmitBtn) loginSubmitBtn.disabled = true;
+  if (loginSubmitText) loginSubmitText.textContent = "AUTHENTICATING...";
+
+  try {
+    const user = await loginUser(BACKEND_URL, {
+      email: emailVal,
+      password: passwordVal,
+      rememberMe,
+    });
+    await onLoginSuccess(user);
+  } catch (err: any) {
+    const status = err.response?.status;
+    const detail = err.response?.data?.detail;
+
+    if (status === 401) {
+      showAuthAlert("error", "Invalid email or password.");
+    } else if (status === 403) {
+      showAuthAlert("error", "Your account is inactive. Please contact an administrator.");
+    } else if (status === 422) {
+      showAuthAlert("error", "Enter a valid email address and password.");
+    } else if (detail && typeof detail === "string") {
+      showAuthAlert("error", detail);
+    } else {
+      showAuthAlert(
+        "error",
+        "Unable to connect to authentication service. Verify backend is running."
+      );
+    }
+  } finally {
+    if (loginSubmitBtn) loginSubmitBtn.disabled = false;
+    if (loginSubmitText) loginSubmitText.textContent = "SIGN IN";
+  }
+});
+
+// Logout button listener
+logoutBtn?.addEventListener("click", (e) => {
+  e.preventDefault();
+  if (confirm("Are you sure you want to sign out of EarthWatch AI?")) {
+    performLogout();
+  }
+});
+
+// User Management Modal Handlers
+btnRefreshUsers?.addEventListener("click", () => {
+  renderUserManagement();
+});
+
+btnOpenAddUser?.addEventListener("click", () => {
+  if (addUserModal) addUserModal.classList.add("open");
+  if (addUserAlert) addUserAlert.style.display = "none";
+  if (addUserForm) addUserForm.reset();
+});
+
+closeAddUserBtn?.addEventListener("click", () => {
+  if (addUserModal) addUserModal.classList.remove("open");
+});
+
+cancelAddUserBtn?.addEventListener("click", () => {
+  if (addUserModal) addUserModal.classList.remove("open");
+});
+
+addUserForm?.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  if (!addUserName || !addUserEmail || !addUserPassword || !addUserRole) return;
+
+  const nameVal = addUserName.value.trim();
+  const emailVal = addUserEmail.value.trim();
+  const passVal = addUserPassword.value;
+  const roleVal = addUserRole.value;
+
+  let formErr = false;
+  if (!nameVal) {
+    if (addUserNameError) {
+      addUserNameError.textContent = "Full name is required.";
+      addUserNameError.classList.add("visible");
+    }
+    formErr = true;
+  }
+  if (!emailVal || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailVal)) {
+    if (addUserEmailError) {
+      addUserEmailError.textContent = "Valid email is required.";
+      addUserEmailError.classList.add("visible");
+    }
+    formErr = true;
+  }
+  if (!passVal || passVal.length < 8) {
+    if (addUserPasswordError) {
+      addUserPasswordError.textContent = "Password must be at least 8 characters.";
+      addUserPasswordError.classList.add("visible");
+    }
+    formErr = true;
+  }
+
+  if (formErr) return;
+
+  const submitBtn = document.querySelector<HTMLButtonElement>("#submit-add-user-btn");
+  if (submitBtn) {
+    submitBtn.disabled = true;
+    submitBtn.textContent = "Creating...";
+  }
+
+  try {
+    await axios.post(`${BACKEND_URL}/users`, {
+      name: nameVal,
+      email: emailVal,
+      password: passVal,
+      role: roleVal,
+    });
+    if (addUserModal) addUserModal.classList.remove("open");
+    await renderUserManagement();
+  } catch (err: any) {
+    if (addUserAlert) {
+      addUserAlert.className = "auth-alert-banner error";
+      addUserAlert.textContent = err.response?.data?.detail || "Failed to create user.";
+      addUserAlert.style.display = "flex";
+    }
+  } finally {
+    if (submitBtn) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = "Create User";
+    }
+  }
+});
+
+// App Startup Bootstrap
+async function bootstrapEarthWatch() {
+  setupAxiosInterceptors(() => {
+    handleSessionExpired();
+  });
+
+  // Initialize 4D spatial login controller
+  spatialLoginController = initSpatialLogin();
+
+  try {
+    const user = await checkStoredSession(BACKEND_URL);
+    if (user) {
+      await onLoginSuccess(user);
+    } else {
+      if (authLoadingOverlay) authLoadingOverlay.style.display = "none";
+      if (appLayout) appLayout.style.display = "none";
+      if (authContainer) authContainer.style.display = "flex";
+      spatialLoginController.start();
+    }
+  } catch (err) {
+    console.warn("Bootstrap session check failed:", err);
+    if (authLoadingOverlay) authLoadingOverlay.style.display = "none";
+    if (appLayout) appLayout.style.display = "none";
+    if (authContainer) authContainer.style.display = "flex";
+    spatialLoginController.start();
+  }
+}
+
+// Initial statistics
+updateTopStatistics();
+
+// Start application via authentication bootstrap
+bootstrapEarthWatch();
+

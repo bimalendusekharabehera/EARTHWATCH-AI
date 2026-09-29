@@ -30,6 +30,18 @@ data/*.db
 data/*.sqlite
 backend/data/sentinel1/
 **/data/sentinel1/
+backend/data/sentinel1/processed/
+**/data/sentinel1/processed/
+backend/data/sentinel1/flood_detection/
+**/data/sentinel1/flood_detection/
+
+# Satellite rasters, archives & temp files — NEVER commit
+*.tif
+*.tiff
+*.SAFE
+*.SAFE/
+*.zip
+*.part
 
 # Logs & temporary files
 *.log

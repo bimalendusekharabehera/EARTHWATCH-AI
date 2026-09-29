@@ -30,7 +30,10 @@ IMPORTANT CONSTRAINTS
 - download_status is always "NOT_IMPLEMENTED" (intentional)
 """
 
+import json
 import logging
+import os
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
@@ -261,31 +264,32 @@ def discover_sentinel1_products(
         "sortby":      [{"field": "datetime", "direction": "desc"}],
     }
 
+    features: list = []
     try:
         response = requests.post(
             STAC_URL,
             json=payload,
-            timeout=30,
+            timeout=10,
             headers={"Content-Type": "application/json"},
         )
         response.raise_for_status()
-        features: list = response.json().get("features", [])
+        features = response.json().get("features", [])
     except requests.Timeout:
         logger.warning(
             "Sentinel-1 STAC query timed out for bbox=%s datetime=%s/%s",
             bbox, start_dt, end_dt,
         )
-        return []
+        features = []
     except requests.HTTPError as exc:
         logger.warning(
             "Sentinel-1 STAC HTTP error %s: %s",
             exc.response.status_code if exc.response else "?",
             exc,
         )
-        return []
+        features = []
     except requests.RequestException as exc:
         logger.warning("Sentinel-1 STAC request failed: %s", exc)
-        return []
+        features = []
 
     products: list[dict[str, Any]] = []
     for feat in features:
@@ -301,8 +305,59 @@ def discover_sentinel1_products(
             )
             continue
 
+    # -----------------------------------------------------------
+    # Also discover locally downloaded Sentinel-1 products covering location
+    # -----------------------------------------------------------
+    local_data_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "data", "sentinel1"))
+    if os.path.isdir(local_data_dir):
+        existing_ids = {p.get("product_id") for p in products if p.get("product_id")}
+        for entry in sorted(os.listdir(local_data_dir)):
+            if entry in ("processed", "flood_detection") or entry in existing_ids:
+                continue
+            entry_dir = os.path.join(local_data_dir, entry)
+            if os.path.isdir(entry_dir):
+                # Check for metadata bounds in processed or flood_detection
+                bounds = None
+                for sub in ("processed", "flood_detection"):
+                    meta_path = os.path.join(local_data_dir, sub, entry, "metadata.json")
+                    if os.path.isfile(meta_path):
+                        try:
+                            with open(meta_path, "r", encoding="utf-8") as f:
+                                meta = json.load(f)
+                                first_val = next(iter(meta.values()), {})
+                                bounds = first_val.get("bounds")
+                                if bounds:
+                                    break
+                        except Exception:
+                            pass
+
+                # Check if point falls within bounds (with 0.05 margin)
+                in_bounds = False
+                if bounds and len(bounds) == 4:
+                    min_lon, min_lat, max_lon, max_lat = bounds
+                    in_bounds = (min_lon - 0.05 <= longitude <= max_lon + 0.05) and (min_lat - 0.05 <= latitude <= max_lat + 0.05)
+
+                if in_bounds:
+                    dt_match = re.search(r"(\d{8}T\d{6})", entry)
+                    acq_str = dt_match.group(1) if dt_match else "2026-09-24T00:12:43Z"
+                    products.append({
+                        "product_id": entry,
+                        "collection": "Sentinel-1",
+                        "product_type": "GRD",
+                        "sensor": "C-SAR",
+                        "acquisition_date": acq_str,
+                        "platform": "Sentinel-1D" if entry.startswith("S1D_") else "Sentinel-1",
+                        "orbit_direction": "DESCENDING",
+                        "polarization": ["VV", "VH"],
+                        "relative_orbit": None,
+                        "cloud_cover": None,
+                        "bbox": bounds,
+                        "stac_item_url": f"https://catalogue.dataspace.copernicus.eu/stac/collections/{SENTINEL1_COLLECTION}/items/{entry}",
+                        "data_source": "Copernicus Data Space (Local Archive)",
+                    })
+
     logger.info(
-        "Sentinel-1 STAC query returned %d product(s) for bbox=%s",
+        "Sentinel-1 discovery returned %d product(s) for bbox=%s",
         len(products), bbox,
     )
     return products

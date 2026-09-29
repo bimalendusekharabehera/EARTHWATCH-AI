@@ -21,6 +21,16 @@ build/
 data/*.db
 data/*.sqlite
 data/sentinel1/
+data/sentinel1/processed/
+data/sentinel1/flood_detection/
+
+# Satellite rasters, archives & temp files — NEVER commit
+*.tif
+*.tiff
+*.SAFE
+*.SAFE/
+*.zip
+*.part
 
 # Logs
 *.log

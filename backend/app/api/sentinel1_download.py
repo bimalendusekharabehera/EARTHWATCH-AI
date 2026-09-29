@@ -28,7 +28,7 @@ SECURITY CONSTRAINTS
 - No database tables modified.
 """
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -38,6 +38,7 @@ from app.services.sentinel1_download_service import (
     is_product_downloaded,
     validate_sentinel1_product,
 )
+from app.api.deps import get_current_user
 
 router = APIRouter()
 
@@ -105,7 +106,10 @@ def _get_location_record(location_id: int) -> dict | None:
 # ──────────────────────────────────────────────────────────────
 
 @router.post("/sentinel1/download")
-def download_sentinel1_product(body: Sentinel1DownloadRequest):
+def download_sentinel1_product(
+    body: Sentinel1DownloadRequest,
+    current_user: dict = Depends(get_current_user),
+):
     """
     Download exactly ONE user-selected Sentinel-1 SAR product.
 
