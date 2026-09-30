@@ -1,9 +1,10 @@
 import os
 import tempfile
 
-from fastapi import APIRouter, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 
 from app.services.sar_flood_service import detect_flood_from_sar
+from app.api.deps import get_current_user
 
 
 router = APIRouter()
@@ -15,7 +16,8 @@ router = APIRouter()
 
 @router.post("/flood/sar")
 async def sar_flood_detection(
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Upload a Sentinel-1 SAR GeoTIFF and perform

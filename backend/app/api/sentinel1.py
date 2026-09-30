@@ -24,6 +24,7 @@ days : int
     Optional. Number of past days to search (default 7, max 30).
 """
 
+from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Depends
 
 from app.config.database import get_connection
@@ -96,6 +97,8 @@ def _get_location(location_id: int) -> dict:
         "state":       row.State,
         "latitude":    float(row.Latitude),
         "longitude":   float(row.Longitude),
+        "is_database_monitored": True,
+        "badge": "DATABASE MONITORED",
     }
 
 
@@ -105,9 +108,21 @@ def _get_location(location_id: int) -> dict:
 
 @router.get("/sentinel1/products")
 def get_sentinel1_products(
-    location_id: int = Query(
-        ...,
+    location_id: Optional[int] = Query(
+        default=None,
         description="Location ID from the SQL Server Locations table.",
+    ),
+    lat: Optional[float] = Query(
+        default=None,
+        description="Optional latitude for dynamically searched geographic locations.",
+    ),
+    lon: Optional[float] = Query(
+        default=None,
+        description="Optional longitude for dynamically searched geographic locations.",
+    ),
+    location_name: Optional[str] = Query(
+        default=None,
+        description="Optional name for dynamically searched geographic locations.",
     ),
     days: int = Query(
         default=7,
@@ -122,24 +137,40 @@ def get_sentinel1_products(
 ):
     """
     Discover available Sentinel-1 SAR GRD products from Copernicus Data Space
-    for the specified monitored location and time window.
+    for the specified monitored location or searched geographic coordinates.
 
     Steps
     -----
-    1. Validate location_id against the SQL Server Locations table.
-    2. Return HTTP 404 if the location does not exist.
-    3. Extract latitude and longitude from the Locations row.
-    4. Search the Copernicus STAC catalogue for Sentinel-1 GRD products.
-    5. Return structured product metadata only.
+    1. If location_id provided: validate against SQL Server Locations table.
+       If lat/lon provided: use searched geographic coordinates directly.
+    2. Search the Copernicus STAC catalogue for Sentinel-1 GRD products.
+    3. Return structured product metadata only.
 
     This endpoint does NOT download any satellite files.
     download_status is always "NOT_IMPLEMENTED".
     """
 
     # -----------------------------------------------------------
-    # 1. Resolve location from SQL Server
+    # 1. Resolve location from SQL Server or searched coordinates
     # -----------------------------------------------------------
-    location = _get_location(location_id)
+    if location_id is not None:
+        location = _get_location(location_id)
+    elif lat is not None and lon is not None:
+        location = {
+            "location_id": None,
+            "name": location_name or f"Coordinates ({lat:.4f}, {lon:.4f})",
+            "district": "",
+            "state": "",
+            "latitude": float(lat),
+            "longitude": float(lon),
+            "is_database_monitored": False,
+            "badge": "SEARCHED LOCATION",
+        }
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Either location_id or both lat and lon must be provided.",
+        )
 
     # -----------------------------------------------------------
     # 2. Query Copernicus STAC for Sentinel-1 products

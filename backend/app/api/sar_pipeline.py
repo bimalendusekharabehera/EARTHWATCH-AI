@@ -17,13 +17,14 @@ POST /sar/pipeline/discover
     Does NOT download any raster data.
 """
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 
 from app.services.sar_pipeline_service import (
     discover_scenes,
     get_registry_scenes,
     get_pipeline_summary,
 )
+from app.api.deps import get_current_user
 
 
 router = APIRouter()
@@ -34,7 +35,9 @@ router = APIRouter()
 # ──────────────────────────────────────────────────────────────
 
 @router.get("/sar/pipeline/summary")
-def sar_pipeline_summary():
+def sar_pipeline_summary(
+    current_user: dict = Depends(get_current_user)
+):
     """
     Return a high-level summary of the SAR acquisition pipeline:
     total scenes in the registry, counts by status, and the four
@@ -69,6 +72,7 @@ def sar_pipeline_scenes(
         le=200,
         description="Maximum number of scenes to return"
     ),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     List Sentinel-1 scenes stored in the local registry.
@@ -117,6 +121,7 @@ def sar_pipeline_discover(
         le=14,
         description="Half-width of temporal search window in days"
     ),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Trigger a Sentinel-1 scene discovery run against the

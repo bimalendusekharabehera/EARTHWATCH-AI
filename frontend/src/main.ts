@@ -277,6 +277,7 @@ interface Sentinel1Product {
   bbox: number[] | null;
   stac_item_url: string | null;
   data_source: string;
+  download_status?: string | null;
 }
 
 interface Sentinel1ProductResponse {
@@ -405,11 +406,26 @@ interface FloodDetectionStatusResponse {
 }
 
 // Central Selected-Location State
+export interface SearchedLocation {
+  name: string;
+  district?: string;
+  state?: string;
+  country?: string;
+  display_name?: string;
+  latitude: number;
+  longitude: number;
+  is_database_monitored: boolean;
+  location_id?: number | null;
+  badge?: string;
+}
+
 export let dbLocations: LocationRecord[] = [];
-export let selectedLocationId: number = 1;
+export let selectedLocationId: number | null = 1;
 export let selectedLocationName: string = "Bhubaneswar";
 export let selectedLatitude: number = 20.2961;
 export let selectedLongitude: number = 85.8245;
+export let isCurrentLocationDatabaseMonitored: boolean = true;
+export let currentSearchedLocation: SearchedLocation | null = null;
 export let allObservations: SatelliteObservation[] = [];
 export let allFloodDetections: FloodDetectionRecord[] = [];
 export let allFloodRegions: FloodRegionRecord[] = [];
@@ -423,6 +439,8 @@ export function getSelectedLocationState() {
     selectedLocationName,
     selectedLatitude,
     selectedLongitude,
+    isCurrentLocationDatabaseMonitored,
+    currentSearchedLocation,
   };
 }
 
@@ -704,14 +722,29 @@ appRoot.innerHTML = `
     <!-- TOP HEADER -->
     <header class="app-topbar">
       <div class="topbar-left">
-        <!-- Location Selector with SQL DATABASE provenance -->
-        <div class="topbar-location-control">
+        <!-- Dynamic Monitored Location Search Combobox -->
+        <div class="topbar-location-control" id="topbar-location-control">
           <span class="location-icon">📍</span>
           <div class="location-select-wrap">
-            <label for="db-location-select" class="topbar-label">Monitored Location</label>
-            <select id="db-location-select" class="db-select-topbar">
-              <option value="">Loading locations...</option>
-            </select>
+            <div class="location-label-row">
+              <label for="topbar-location-input" class="topbar-label">Monitored Location</label>
+              <span id="active-loc-type-badge" class="loc-type-badge badge-db">DATABASE MONITORED</span>
+            </div>
+            <div class="location-search-combobox">
+              <input
+                id="topbar-location-input"
+                type="text"
+                class="location-search-input"
+                placeholder="Search any location... (e.g. Cuttack, Puri, Delhi)"
+                value="Bhubaneswar (Khordha)"
+                autocomplete="off"
+              />
+              <span class="search-input-icon">🔍</span>
+              <!-- Hidden select retained for backward compatibility -->
+              <select id="db-location-select" class="db-select-topbar" style="display:none;"></select>
+            </div>
+            <!-- Dynamic dropdown menu for autocomplete / search results -->
+            <div id="location-search-dropdown" class="location-search-dropdown" style="display:none;"></div>
           </div>
         </div>
 
@@ -721,13 +754,8 @@ appRoot.innerHTML = `
           <span>State: <strong id="meta-state">Odisha</strong></span>
           <span>Coords: <strong id="meta-coords">20.2961° N, 85.8245° E</strong></span>
         </div>
-
-        <!-- OpenWeather Geocoding Search (compact) -->
-        <div class="topbar-search-group">
-          <input id="location-input" type="text" placeholder="Search city..." class="topbar-search-input" />
-          <button id="location-button" class="topbar-search-btn">Search</button>
-        </div>
       </div>
+
 
       <!-- Topbar Right: 4 Real Statistics & Actions -->
       <div class="topbar-right">
@@ -788,12 +816,6 @@ appRoot.innerHTML = `
         
         <div class="section-title-row">
           <h2 style="font-size:18px; color:var(--text-main);">Earth Observation &amp; Disaster Intelligence Overview</h2>
-          <div class="provenance-legend">
-            <span class="provenance-tag tag-db">SQL DATABASE</span>
-            <span class="provenance-tag tag-stac">COPERNICUS STAC</span>
-            <span class="provenance-tag tag-live">LIVE WEATHER</span>
-            <span class="provenance-tag tag-proto">PROTOTYPE MODEL</span>
-          </div>
         </div>
 
         <!-- METRIC CARDS (9 CORE OBSERVATIONS) -->
@@ -802,7 +824,6 @@ appRoot.innerHTML = `
           <div class="card">
             <div class="card-header-row">
               <h3>🌊 Potential Flood Area</h3>
-              <span class="provenance-tag tag-db">SQL SERVER</span>
             </div>
             <p class="value" id="flooded-area">--</p>
             <span class="card-subtitle" id="flood-extent-subtitle">Database candidate record</span>
@@ -812,7 +833,6 @@ appRoot.innerHTML = `
           <div class="card">
             <div class="card-header-row">
               <h3>🎯 Confidence</h3>
-              <span class="provenance-tag tag-proto">PROTOTYPE</span>
             </div>
             <p class="value" id="detection-confidence">--</p>
             <span class="card-subtitle" id="detection-method-subtitle">Prototype / Baseline Detection</span>
@@ -822,7 +842,6 @@ appRoot.innerHTML = `
           <div class="card">
             <div class="card-header-row">
               <h3>🛰️ Satellite Record</h3>
-              <span class="provenance-tag tag-db">DATABASE</span>
             </div>
             <p class="value" id="satellite-observation">--</p>
             <span class="card-subtitle" id="satellite-meta-subtitle">Sensor &amp; date pending</span>
@@ -832,7 +851,6 @@ appRoot.innerHTML = `
           <div class="card">
             <div class="card-header-row">
               <h3>📡 Sentinel-1 SAR</h3>
-              <span class="provenance-tag tag-stac">COPERNICUS STAC</span>
             </div>
             <p class="value" id="sar-status">Checking...</p>
             <span class="card-subtitle" id="sar-details">Copernicus STAC discovery</span>
@@ -842,7 +860,6 @@ appRoot.innerHTML = `
           <div class="card">
             <div class="card-header-row">
               <h3>⚠️ Prototype Risk</h3>
-              <span class="provenance-tag tag-proto">PROTOTYPE</span>
             </div>
             <p class="value" id="flood-risk">--</p>
             <span class="card-subtitle" id="analysis-status">Ready for evaluation</span>
@@ -852,7 +869,6 @@ appRoot.innerHTML = `
           <div class="card">
             <div class="card-header-row">
               <h3>🌧️ Rainfall</h3>
-              <span class="provenance-tag tag-live" id="rainfall-source-tag">LIVE WEATHER</span>
             </div>
             <p class="value" id="rainfall">--</p>
             <span class="card-subtitle" id="rainfall-status">Precipitation depth</span>
@@ -862,7 +878,6 @@ appRoot.innerHTML = `
           <div class="card">
             <div class="card-header-row">
               <h3>🌡️ Temperature</h3>
-              <span class="provenance-tag tag-live">LIVE WEATHER</span>
             </div>
             <p class="value" id="temperature">--</p>
             <span class="card-subtitle" id="condition">Current reading</span>
@@ -872,7 +887,6 @@ appRoot.innerHTML = `
           <div class="card">
             <div class="card-header-row">
               <h3>💧 Air Quality</h3>
-              <span class="provenance-tag tag-live">LIVE WEATHER</span>
             </div>
             <p class="value" id="air-quality">--</p>
             <span class="card-subtitle" id="air-quality-status">AQI status</span>
@@ -882,7 +896,6 @@ appRoot.innerHTML = `
           <div class="card">
             <div class="card-header-row">
               <h3>📍 Affected Regions</h3>
-              <span class="provenance-tag tag-db">SQL SERVER</span>
             </div>
             <p class="value" id="affected-regions">--</p>
             <span class="card-subtitle" id="regions-subtitle">Database sub-regions</span>
@@ -912,10 +925,9 @@ appRoot.innerHTML = `
               <h3 style="font-size:14px; color:var(--text-main);">🤖 AI Environmental &amp; Atmospheric Insight</h3>
               <span class="card-subtitle">Composite live meteorological, air quality &amp; surface indices.</span>
             </div>
-            <span class="provenance-tag tag-live">● Active Telemetry</span>
           </div>
 
-          <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:12px; margin-top:12px;">
+          <div class="environmental-insight-grid">
             <div class="card" style="background:var(--bg-card-subtle);">
               <h3>Overall Condition</h3>
               <p id="environment-status" style="font-size:14px; font-weight:700; color:var(--accent-cyan); margin:4px 0;">Evaluating...</p>
@@ -1172,73 +1184,107 @@ appRoot.innerHTML = `
             </div>
           </div>
 
-          <!-- WORKFLOW STEPPER -->
-          <div class="workflow-stepper" id="workflow-stepper">
-            <!-- Step 1: Discover -->
-            <div class="stepper-step completed" id="step-1-discover" style="cursor:pointer;" title="Go to Satellite Discovery">
-              <div class="step-indicator">
-                <span class="step-num">1</span>
-                <span class="step-check">✓</span>
-              </div>
-              <div class="step-text">
-                <div class="step-title">1 Discover</div>
-                <div class="step-desc">Search Sentinel-1</div>
-              </div>
+          <!-- 9-STAGE SENTINEL-1 RADAR FLOOD DETECTION PIPELINE WORKFLOW DIAGRAM -->
+          <div class="pipeline-workflow-card" id="flood-pipeline-card" style="margin-top:14px; margin-bottom:14px; width:100%;">
+            <div class="pipeline-workflow-header">
+              <span class="pipeline-workflow-title">
+                <span>🌊</span> Sentinel-1 SAR Radar Flood Detection Pipeline
+              </span>
+              <span class="pipeline-stage-badge" id="flood-pipeline-current-stage">● Candidate Flood Mask</span>
             </div>
-            <div class="stepper-line completed" id="stepper-line-1"></div>
+            <div class="pipeline-flow-row" id="flood-pipeline-flow-row">
+              <!-- 1. SENTINEL-1 SAR -->
+              <div class="pipeline-node completed" id="f-stage-s1" title="Sentinel-1 C-SAR constellation">
+                <div class="pipeline-node-icon">✓</div>
+                <div class="pipeline-node-text">
+                  <span class="pipeline-node-title">Sentinel-1 SAR</span>
+                  <span class="pipeline-node-desc">C-Band Synthetic Aperture</span>
+                </div>
+              </div>
+              <div class="pipeline-arrow">→</div>
 
-            <!-- Step 2: Download -->
-            <div class="stepper-step active" id="step-2-download" style="cursor:pointer;" title="View Product Download Status">
-              <div class="step-indicator">
-                <span class="step-num">2</span>
-                <span class="step-check">✓</span>
+              <!-- 2. PRODUCT SELECTION -->
+              <div class="pipeline-node completed" id="f-stage-product" title="Product Selection from Copernicus STAC">
+                <div class="pipeline-node-icon">✓</div>
+                <div class="pipeline-node-text">
+                  <span class="pipeline-node-title">Product Selection</span>
+                  <span class="pipeline-node-desc">GRD Scene Query</span>
+                </div>
               </div>
-              <div class="step-text">
-                <div class="step-title">2 Download</div>
-                <div class="step-desc">Get Product</div>
-              </div>
-            </div>
-            <div class="stepper-line" id="stepper-line-2"></div>
+              <div class="pipeline-arrow">→</div>
 
-            <!-- Step 3: Preprocess -->
-            <div class="stepper-step" id="step-3-preprocess" style="cursor:pointer;" title="Run SAR Preprocessing">
-              <div class="step-indicator">
-                <span class="step-num">3</span>
-                <span class="step-check">✓</span>
+              <!-- 3. DOWNLOAD -->
+              <div class="pipeline-node" id="f-stage-download" title="Download SAR Product (~1.25 GB)">
+                <div class="pipeline-node-icon">○</div>
+                <div class="pipeline-node-text">
+                  <span class="pipeline-node-title">Download</span>
+                  <span class="pipeline-node-desc">CDSE Asset Retrieval</span>
+                </div>
               </div>
-              <div class="step-text">
-                <div class="step-title">3 Preprocess</div>
-                <div class="step-desc">Process SAR</div>
-              </div>
-            </div>
-            <div class="stepper-line" id="stepper-line-3"></div>
+              <div class="pipeline-arrow">→</div>
 
-            <!-- Step 4: Flood Detection -->
-            <div class="stepper-step pending" id="step-4-detection" style="cursor:pointer;" title="Prototype SAR Flood Detection">
-              <div class="step-indicator">
-                <span class="step-num">4</span>
-                <span class="step-check">✓</span>
+              <!-- 4. SAR PREPROCESSING -->
+              <div class="pipeline-node" id="f-stage-preprocess" title="SAR Preprocessing into GeoTIFF">
+                <div class="pipeline-node-icon">○</div>
+                <div class="pipeline-node-text">
+                  <span class="pipeline-node-title">SAR Preprocessing</span>
+                  <span class="pipeline-node-desc">Raster Extraction &amp; CRS</span>
+                </div>
               </div>
-              <div class="step-text">
-                <div class="step-title">4 Flood Detection</div>
-                <div class="step-desc" id="step-4-desc">Low-Backscatter</div>
-              </div>
-            </div>
-            <div class="stepper-line" id="stepper-line-4"></div>
+              <div class="pipeline-arrow">→</div>
 
-            <!-- Step 5: Analysis & Report -->
-            <div class="stepper-step pending" id="step-5-report" style="cursor:pointer;" title="Open Disaster Assessment Report">
-              <div class="step-indicator">
-                <span class="step-num">5</span>
-                <span class="step-check">✓</span>
+              <!-- 5. VV / VH DATA -->
+              <div class="pipeline-node" id="f-stage-polarization" title="VV / VH Polarization Channels">
+                <div class="pipeline-node-icon">○</div>
+                <div class="pipeline-node-text">
+                  <span class="pipeline-node-title">VV / VH Data</span>
+                  <span class="pipeline-node-desc">Dual-Pol Decibel Raster</span>
+                </div>
               </div>
-              <div class="step-text">
-                <div class="step-title">5 Analysis &amp; Report</div>
-                <div class="step-desc" id="step-5-desc">Generate Dossier</div>
+              <div class="pipeline-arrow">→</div>
+
+              <!-- 6. BACKSCATTER THRESHOLD -->
+              <div class="pipeline-node" id="f-stage-threshold" title="Backscatter Cutoff Thresholding">
+                <div class="pipeline-node-icon">○</div>
+                <div class="pipeline-node-text">
+                  <span class="pipeline-node-title">Backscatter Threshold</span>
+                  <span class="pipeline-node-desc">DN Cutoff / Otsu Method</span>
+                </div>
+              </div>
+              <div class="pipeline-arrow">→</div>
+
+              <!-- 7. CANDIDATE FLOOD MASK -->
+              <div class="pipeline-node" id="f-stage-mask" title="Candidate Low-Backscatter Inundation Mask">
+                <div class="pipeline-node-icon">○</div>
+                <div class="pipeline-node-text">
+                  <span class="pipeline-node-title">Candidate Flood Mask</span>
+                  <span class="pipeline-node-desc">Low-Backscatter Pixels</span>
+                </div>
+              </div>
+              <div class="pipeline-arrow">→</div>
+
+              <!-- 8. AREA CALCULATION -->
+              <div class="pipeline-node" id="f-stage-area" title="WGS-84 Geodesic Inundation Area">
+                <div class="pipeline-node-icon">○</div>
+                <div class="pipeline-node-text">
+                  <span class="pipeline-node-title">Area Calculation</span>
+                  <span class="pipeline-node-desc">Geodesic Pixel Metric</span>
+                </div>
+              </div>
+              <div class="pipeline-arrow">→</div>
+
+              <!-- 9. FLOOD ANALYSIS -->
+              <div class="pipeline-node" id="f-stage-analysis" title="Disaster Assessment & Synthesis">
+                <div class="pipeline-node-icon">○</div>
+                <div class="pipeline-node-text">
+                  <span class="pipeline-node-title">Flood Analysis</span>
+                  <span class="pipeline-node-desc">Assessment &amp; Report</span>
+                </div>
               </div>
             </div>
           </div>
         </div>
+
 
         <!-- PIPELINE CONTROL BAR -->
         <div class="flood-ctrl-panel" id="flood-ctrl-panel">
@@ -1276,7 +1322,6 @@ appRoot.innerHTML = `
                 <h3 class="panel-title">Processing Results</h3>
               </div>
               <div class="panel-header-right">
-                <span class="provenance-tag tag-proto">PROTOTYPE SAR &amp; FLOOD</span>
               </div>
             </div>
 
@@ -1292,58 +1337,33 @@ appRoot.innerHTML = `
             </div>
           </div>
 
-          <!-- BOTTOM RIGHT: PROCESSING STATUS -->
-          <div class="dashboard-panel status-timeline-panel">
+          <!-- BOTTOM RIGHT: DETECTION SUMMARY & FOOTPRINT EXTENT -->
+          <div class="dashboard-panel status-timeline-panel" id="flood-footprint-summary-panel">
             <div class="panel-header">
               <div class="panel-header-left">
-                <span class="panel-icon">📈</span>
-                <h3 class="panel-title">Processing Status</h3>
+                <span class="panel-icon">🗺️</span>
+                <h3 class="panel-title">Footprint &amp; Detection Summary</h3>
               </div>
               <div class="panel-header-right">
-                <span class="timeline-live-badge" id="timeline-live-badge">IDLE</span>
+                <span class="timeline-live-badge" id="timeline-live-badge">READY</span>
               </div>
             </div>
 
-            <div class="timeline-panel-body">
-              <div class="processing-timeline" id="processing-timeline">
-                <!-- 1. Product Validated -->
-                <div class="timeline-node completed" id="tl-node-validate">
-                  <div class="node-icon-circle">✓</div>
-                  <div class="node-label">Product Validated</div>
-                  <div class="node-sub" id="tl-sub-validate">STAC Metadata Verified</div>
-                </div>
-                <div class="timeline-connector" id="tl-conn-1"></div>
-
-                <!-- 2. Downloading -->
-                <div class="timeline-node pending" id="tl-node-download">
-                  <div class="node-icon-circle">2</div>
-                  <div class="node-label">Downloading</div>
-                  <div class="node-sub" id="tl-sub-download">Awaiting download</div>
-                </div>
-                <div class="timeline-connector" id="tl-conn-2"></div>
-
-                <!-- 3. Preprocessing -->
-                <div class="timeline-node pending" id="tl-node-preprocess">
-                  <div class="node-icon-circle">3</div>
-                  <div class="node-label">Preprocessing</div>
-                  <div class="node-sub" id="tl-sub-preprocess">Awaiting processing</div>
-                </div>
-                <div class="timeline-connector" id="tl-conn-3"></div>
-
-                <!-- 4. Flood Detection -->
-                <div class="timeline-node coming-soon" id="tl-node-flood">
-                  <div class="node-icon-circle">4</div>
-                  <div class="node-label">Flood Detection</div>
-                  <div class="node-sub" id="tl-sub-flood">Low-backscatter mask</div>
-                </div>
-                <div class="timeline-connector" id="tl-conn-4"></div>
-
-                <!-- 5. Analysis & Report -->
-                <div class="timeline-node coming-soon" id="tl-node-report">
-                  <div class="node-icon-circle">5</div>
-                  <div class="node-label">Analysis &amp; Report</div>
-                  <div class="node-sub" id="tl-sub-report">Disaster Dossier</div>
-                </div>
+            <div class="timeline-panel-body" style="padding:16px;">
+              <div id="flood-footprint-summary-content">
+                <!-- Dynamically populated by updateFloodDetectionView() -->
+              </div>
+              <!-- Hidden legacy timeline containers for safe compatibility -->
+              <div id="processing-timeline" style="display:none;">
+                <div id="tl-node-validate"><div class="node-icon-circle">✓</div><div id="tl-sub-validate"></div></div>
+                <div id="tl-conn-1"></div>
+                <div id="tl-node-download"><div class="node-icon-circle">2</div><div id="tl-sub-download"></div></div>
+                <div id="tl-conn-2"></div>
+                <div id="tl-node-preprocess"><div class="node-icon-circle">3</div><div id="tl-sub-preprocess"></div></div>
+                <div id="tl-conn-3"></div>
+                <div id="tl-node-flood"><div class="node-icon-circle">4</div><div id="tl-sub-flood"></div></div>
+                <div id="tl-conn-4"></div>
+                <div id="tl-node-report"><div class="node-icon-circle">5</div><div id="tl-sub-report"></div></div>
               </div>
             </div>
           </div>
@@ -1366,6 +1386,84 @@ appRoot.innerHTML = `
               <p class="s1-page-subtitle">Comprehensive multi-source hydro-meteorological observation, satellite coverage, and risk intelligence for monitored locations.</p>
             </div>
           </div>
+        <!-- 7-STAGE LOCATION OBSERVATION & TELEMETRY PIPELINE WORKFLOW DIAGRAM -->
+        <div class="pipeline-workflow-card" id="loc-obs-pipeline-card" style="margin-top:14px; margin-bottom:14px; width:100%;">
+          <div class="pipeline-workflow-header">
+            <span class="pipeline-workflow-title">
+              <span>📍</span> Location Observation &amp; Telemetry Pipeline
+            </span>
+            <span class="pipeline-stage-badge" id="loc-obs-pipeline-current-stage">● Map Observation</span>
+          </div>
+          <div class="pipeline-flow-row" id="loc-obs-pipeline-flow-row">
+            <!-- 1. LOCATION SEARCH -->
+            <div class="pipeline-node completed" id="lo-stage-search" title="Location Query & Geocoding">
+              <div class="pipeline-node-icon">✓</div>
+              <div class="pipeline-node-text">
+                <span class="pipeline-node-title">Location Search</span>
+                <span class="pipeline-node-desc">Query &amp; Geocoding</span>
+              </div>
+            </div>
+            <div class="pipeline-arrow">→</div>
+
+            <!-- 2. GEOGRAPHIC COORDINATES -->
+            <div class="pipeline-node completed" id="lo-stage-coords" title="Geographic Latitude & Longitude">
+              <div class="pipeline-node-icon">✓</div>
+              <div class="pipeline-node-text">
+                <span class="pipeline-node-title">Geographic Coordinates</span>
+                <span class="pipeline-node-desc">Lat / Lon &amp; District</span>
+              </div>
+            </div>
+            <div class="pipeline-arrow">→</div>
+
+            <!-- 3. MAP OBSERVATION -->
+            <div class="pipeline-node active" id="lo-stage-map" title="Interactive Map Observation">
+              <div class="pipeline-node-icon">●</div>
+              <div class="pipeline-node-text">
+                <span class="pipeline-node-title">Map Observation</span>
+                <span class="pipeline-node-desc">Spatial Centroid &amp; Zoom</span>
+              </div>
+            </div>
+            <div class="pipeline-arrow">→</div>
+
+            <!-- 4. SATELLITE OBSERVATION -->
+            <div class="pipeline-node" id="lo-stage-sat" title="Satellite Sensor & STAC Discovery">
+              <div class="pipeline-node-icon">○</div>
+              <div class="pipeline-node-text">
+                <span class="pipeline-node-title">Satellite Observation</span>
+                <span class="pipeline-node-desc">Sentinel-1 Coverage</span>
+              </div>
+            </div>
+            <div class="pipeline-arrow">→</div>
+
+            <!-- 5. ENVIRONMENTAL CONDITIONS -->
+            <div class="pipeline-node" id="lo-stage-env" title="Live Meteorological & AQI Telemetry">
+              <div class="pipeline-node-icon">○</div>
+              <div class="pipeline-node-text">
+                <span class="pipeline-node-title">Environmental Conditions</span>
+                <span class="pipeline-node-desc">Weather, Rain &amp; AQI</span>
+              </div>
+            </div>
+            <div class="pipeline-arrow">→</div>
+
+            <!-- 6. FLOOD / RISK CONTEXT -->
+            <div class="pipeline-node" id="lo-stage-risk" title="Flood Inundation & Risk Score">
+              <div class="pipeline-node-icon">○</div>
+              <div class="pipeline-node-text">
+                <span class="pipeline-node-title">Flood / Risk Context</span>
+                <span class="pipeline-node-desc">Candidate Extent &amp; Risk</span>
+              </div>
+            </div>
+            <div class="pipeline-arrow">→</div>
+
+            <!-- 7. DISASTER ASSESSMENT -->
+            <div class="pipeline-node" id="lo-stage-assessment" title="Operational Advisory & Dossier">
+              <div class="pipeline-node-icon">○</div>
+              <div class="pipeline-node-text">
+                <span class="pipeline-node-title">Disaster Assessment</span>
+                <span class="pipeline-node-desc">Advisory &amp; Summary</span>
+              </div>
+            </div>
+          </div>
         </div>
 
         <!-- LOCATION SELECTOR & SITE PROVENANCE CARD -->
@@ -1373,14 +1471,14 @@ appRoot.innerHTML = `
           <div class="loc-obs-control-left">
             <span class="location-icon" style="font-size:20px;">📍</span>
             <div>
-              <label for="loc-obs-select" class="topbar-label" style="display:block; margin-bottom:3px;">Monitored Location</label>
+              <label for="loc-obs-select" class="topbar-label" style="display:block; margin-bottom:3px;">Active Monitored Site</label>
               <select id="loc-obs-select" class="db-select" style="min-width:240px;">
                 <option value="">Loading database locations...</option>
               </select>
             </div>
-            <div style="margin-left:8px;">
-              <span id="loc-obs-meta" class="provenance-tag tag-db">--</span>
-              <span id="loc-obs-id-badge" class="provenance-tag tag-stac">LOC-1</span>
+            <div style="margin-left:8px; display:flex; align-items:center; gap:6px;">
+              <span id="loc-obs-meta" style="font-size:12px; color:var(--text-secondary); font-weight:600;">--</span>
+              <span id="loc-obs-id-badge" class="loc-type-badge badge-db">DATABASE MONITORED</span>
             </div>
           </div>
           <div class="loc-obs-control-right">
@@ -1400,7 +1498,6 @@ appRoot.innerHTML = `
                 <h3 class="panel-title">Satellite Observations</h3>
               </div>
               <div class="panel-header-right">
-                <span class="provenance-tag tag-db">DATABASE OBSERVATION</span>
               </div>
             </div>
             <div class="loc-obs-card-body" id="loc-obs-sat-body">
@@ -1416,7 +1513,6 @@ appRoot.innerHTML = `
                 <h3 class="panel-title">Flood Information</h3>
               </div>
               <div class="panel-header-right">
-                <span class="provenance-tag tag-db">SQL SERVER / SAR</span>
               </div>
             </div>
             <div class="loc-obs-card-body" id="loc-obs-flood-body">
@@ -1432,7 +1528,6 @@ appRoot.innerHTML = `
                 <h3 class="panel-title">Risk Information</h3>
               </div>
               <div class="panel-header-right">
-                <span class="provenance-tag tag-proto">PROTOTYPE MODEL</span>
               </div>
             </div>
             <div class="loc-obs-card-body" id="loc-obs-risk-body">
@@ -1448,7 +1543,6 @@ appRoot.innerHTML = `
                 <h3 class="panel-title">Active Alerts</h3>
               </div>
               <div class="panel-header-right">
-                <span class="provenance-tag tag-db">DATABASE ALERT</span>
               </div>
             </div>
             <div class="loc-obs-card-body" id="loc-obs-alerts-body">
@@ -1464,13 +1558,13 @@ appRoot.innerHTML = `
                 <h3 class="panel-title">Observation Status &amp; Live Telemetry</h3>
               </div>
               <div class="panel-header-right">
-                <span class="provenance-tag tag-live">● LIVE TELEMETRY</span>
               </div>
             </div>
             <div class="loc-obs-card-body" id="loc-obs-status-body">
               <div class="state-box">Gathering live telemetry...</div>
             </div>
           </div>
+
 
         </div>
 
@@ -2146,8 +2240,6 @@ appRoot.innerHTML = `
 // ======================================================
 
 const dbLocationSelect = document.querySelector<HTMLSelectElement>("#db-location-select")!;
-const locationInput = document.querySelector<HTMLInputElement>("#location-input")!;
-const locationButton = document.querySelector<HTMLButtonElement>("#location-button")!;
 const metaDistrict = document.querySelector<HTMLElement>("#meta-district")!;
 const metaState = document.querySelector<HTMLElement>("#meta-state")!;
 const metaCoords = document.querySelector<HTMLElement>("#meta-coords")!;
@@ -2397,12 +2489,21 @@ async function fetchSarRegistryScenes(location?: string): Promise<any[]> {
 }
 
 async function fetchSentinel1Products(
-  locationId: number,
-  days: number = 7
+  locationId: number | null,
+  days: number = 7,
+  lat?: number,
+  lon?: number,
+  locationName?: string
 ): Promise<Sentinel1ProductResponse> {
-  const response = await axios.get(`${BACKEND_URL}/sentinel1/products`, {
-    params: { location_id: locationId, days },
-  });
+  const params: any = { days };
+  if (locationId !== null && locationId !== undefined) {
+    params.location_id = locationId;
+  } else if (lat !== undefined && lon !== undefined) {
+    params.lat = lat;
+    params.lon = lon;
+    if (locationName) params.location_name = locationName;
+  }
+  const response = await axios.get(`${BACKEND_URL}/sentinel1/products`, { params });
   return response.data;
 }
 
@@ -2433,13 +2534,17 @@ function formatBytes(bytes?: number | null): string {
 
 async function fetchSentinel1DownloadInfo(
   productId: string,
-  locationId: number
+  locationId?: number | null
 ): Promise<Sentinel1DownloadInfoResponse | null> {
   try {
+    const params: Record<string, any> = { product_id: productId };
+    if (locationId !== null && locationId !== undefined) {
+      params.location_id = locationId;
+    }
     const response = await axios.get<Sentinel1DownloadInfoResponse>(
       `${BACKEND_URL}/sentinel1/download/info`,
       {
-        params: { product_id: productId, location_id: locationId },
+        params,
         timeout: 8000,
       }
     );
@@ -2451,14 +2556,15 @@ async function fetchSentinel1DownloadInfo(
 
 async function requestSentinel1Download(
   productId: string,
-  locationId: number
+  locationId?: number | null
 ): Promise<Sentinel1DownloadResponse> {
+  const payload: Record<string, any> = { product_id: productId };
+  if (locationId !== null && locationId !== undefined) {
+    payload.location_id = locationId;
+  }
   const response = await axios.post<Sentinel1DownloadResponse>(
     `${BACKEND_URL}/sentinel1/download`,
-    {
-      product_id: productId,
-      location_id: locationId,
-    },
+    payload,
     {
       timeout: 300000, // 5 minutes for streaming download
       validateStatus: (status) => status < 500, // Handle 200, 400, 404 cleanly
@@ -2606,11 +2712,15 @@ function updateInsightCard(temperature: number, aqi: number | null | undefined, 
   }
 }
 
-function renderLocationPins(locations: LocationRecord[], activeLocId: number) {
+function renderLocationPins(
+  locations: LocationRecord[],
+  activeLocId: number | null,
+  searchedLoc?: SearchedLocation | null
+) {
   markerLayerGroup.clearLayers();
 
   locations.forEach((loc) => {
-    const isSelected = loc.location_id === activeLocId;
+    const isSelected = activeLocId !== null && loc.location_id === activeLocId;
 
     const customIcon = L.divIcon({
       className: "custom-map-pin",
@@ -2637,7 +2747,8 @@ function renderLocationPins(locations: LocationRecord[], activeLocId: number) {
     const m = L.marker([loc.latitude, loc.longitude], { icon: customIcon });
     m.bindPopup(`
       <div style="color:#0f172a; font-family:sans-serif; min-width:180px;">
-        <h4 style="margin:0 0 4px; color:#0369a1;">${loc.location_name} ${isSelected ? "• Active" : ""}</h4>
+        <span style="font-size:9px; font-weight:700; background:#e0f2fe; color:#0369a1; padding:1px 5px; border-radius:3px;">DATABASE MONITORED</span>
+        <h4 style="margin:4px 0; color:#0369a1;">${loc.location_name} ${isSelected ? "• Active" : ""}</h4>
         <p style="margin:0; font-size:12px;"><strong>District:</strong> ${loc.district}, ${loc.state}</p>
         <p style="margin:2px 0 0; font-size:11px; color:#64748b;">${loc.latitude.toFixed(4)}°N, ${loc.longitude.toFixed(4)}°E</p>
         <div style="margin-top:6px; font-size:11px; color:${isSelected ? "#10b981" : "#0284c7"}; font-weight:600;">
@@ -2656,6 +2767,42 @@ function renderLocationPins(locations: LocationRecord[], activeLocId: number) {
       setTimeout(() => m.openPopup(), 150);
     }
   });
+
+  if (searchedLoc) {
+    const customIcon = L.divIcon({
+      className: "custom-map-pin searched-pin",
+      html: `
+        <div style="
+          background:#f59e0b;
+          color:#060c16;
+          border:2px solid white;
+          border-radius:50%;
+          width:24px;
+          height:24px;
+          display:flex;
+          align-items:center;
+          justify-content:center;
+          font-weight:bold;
+          font-size:11px;
+          box-shadow:0 0 10px rgba(245,158,11,0.9);
+        ">📍</div>
+      `,
+      iconSize: [24, 24],
+      iconAnchor: [12, 12],
+    });
+
+    const m = L.marker([searchedLoc.latitude, searchedLoc.longitude], { icon: customIcon });
+    m.bindPopup(`
+      <div style="color:#0f172a; font-family:sans-serif; min-width:180px;">
+        <span style="font-size:9px; font-weight:700; background:#fef3c7; color:#b45309; padding:1px 5px; border-radius:3px;">SEARCHED LOCATION</span>
+        <h4 style="margin:4px 0; color:#b45309;">${searchedLoc.name} • Active</h4>
+        <p style="margin:0; font-size:12px;"><strong>District/Region:</strong> ${searchedLoc.district || searchedLoc.state || searchedLoc.country || "--"}</p>
+        <p style="margin:2px 0 0; font-size:11px; color:#64748b;">${searchedLoc.latitude.toFixed(4)}°N, ${searchedLoc.longitude.toFixed(4)}°E</p>
+      </div>
+    `);
+    markerLayerGroup.addLayer(m);
+    setTimeout(() => m.openPopup(), 150);
+  }
 }
 
 function renderHistoricalCharts(records: HistoricalFloodRecord[]) {
@@ -2761,8 +2908,18 @@ function renderHistoricalCharts(records: HistoricalFloodRecord[]) {
     .join("");
 }
 
-function renderAlerts(alerts: AlertRecord[], locId: number) {
+function renderAlerts(alerts: AlertRecord[], locId: number | null) {
   if (!alertsContainer || !alertCountBadge) return;
+
+  if (locId === null) {
+    alertCountBadge.textContent = "0 Active";
+    alertsContainer.innerHTML = `
+      <div class="state-box" style="grid-column: 1 / -1;">
+        NO ACTIVE ALERT
+      </div>
+    `;
+    return;
+  }
 
   const locAlerts = alerts.filter((a) => a.location_id === locId);
 
@@ -2770,7 +2927,7 @@ function renderAlerts(alerts: AlertRecord[], locId: number) {
     alertCountBadge.textContent = "0 Active";
     alertsContainer.innerHTML = `
       <div class="state-box" style="grid-column: 1 / -1;">
-        No active alerts for this location.
+        NO ACTIVE ALERT
       </div>
     `;
     return;
@@ -2908,6 +3065,25 @@ async function selectMonitoredLocation(locationIdentifier: number | string) {
     floodDone: false,
     reportDone: false,
   });
+
+  isCurrentLocationDatabaseMonitored = true;
+  currentSearchedLocation = null;
+
+  const activeLocTypeBadge = document.querySelector<HTMLElement>("#active-loc-type-badge");
+  if (activeLocTypeBadge) {
+    activeLocTypeBadge.textContent = "DATABASE MONITORED";
+    activeLocTypeBadge.className = "loc-type-badge badge-db";
+  }
+
+  const topbarLocationInput = document.querySelector<HTMLInputElement>("#topbar-location-input");
+  if (topbarLocationInput) {
+    topbarLocationInput.value = activeLoc.location_name;
+  }
+
+  if (locObsIdBadge) {
+    locObsIdBadge.textContent = "DATABASE MONITORED";
+    locObsIdBadge.className = "loc-type-badge badge-db";
+  }
 
   if (dbLocationSelect) {
     dbLocationSelect.value = String(activeLoc.location_id);
@@ -3141,6 +3317,190 @@ async function selectMonitoredLocation(locationIdentifier: number | string) {
 
   updateLocationObservationView();
   updateFloodDetectionView();
+  updateFloodPipelineWorkflow();
+  updateLocationObservationWorkflow();
+  renderCurrentView();
+}
+
+async function selectSearchedGeographicLocation(item: SearchedLocation) {
+  isCurrentLocationDatabaseMonitored = false;
+  currentSearchedLocation = item;
+  selectedLocationId = null;
+  selectedLocationName = item.name;
+  selectedLatitude = item.latitude;
+  selectedLongitude = item.longitude;
+
+  // Clear previous product selection to prevent stale location data bleed
+  selectedSentinel1Product = null;
+  selectedSentinel1SarStatus = null;
+  selectedSentinel1FloodStatus = null;
+  renderProductDetails(null);
+  renderGlobalProcessingResults(null);
+  updateProcessingTimeline({ badge: "IDLE" });
+  updateWorkflowStepper({
+    discoverDone: true,
+    downloadDone: false,
+    preprocessDone: false,
+    floodDone: false,
+    reportDone: false,
+  });
+
+  const activeLocTypeBadge = document.querySelector<HTMLElement>("#active-loc-type-badge");
+  if (activeLocTypeBadge) {
+    activeLocTypeBadge.textContent = "SEARCHED LOCATION";
+    activeLocTypeBadge.className = "loc-type-badge badge-searched";
+  }
+
+  const topbarLocationInput = document.querySelector<HTMLInputElement>("#topbar-location-input");
+  if (topbarLocationInput) {
+    topbarLocationInput.value = item.display_name || item.name;
+  }
+
+  if (locObsSelect) {
+    locObsSelect.value = "";
+  }
+  if (locObsIdBadge) {
+    locObsIdBadge.textContent = "SEARCHED LOCATION";
+    locObsIdBadge.className = "loc-type-badge badge-searched";
+  }
+  if (comparisonLocationSelect) {
+    comparisonLocationSelect.value = item.name;
+  }
+
+  // Show clear loading state
+  showLocationLoadingState(item.name);
+
+  // 1. Map & Meta Sync
+  metaDistrict.textContent = item.district || item.name;
+  metaState.textContent = item.state || item.country || "Global";
+  metaCoords.textContent = `${item.latitude.toFixed(4)}° N, ${item.longitude.toFixed(4)}° E`;
+  mapActiveCoords.textContent = `${item.latitude.toFixed(4)}° N, ${item.longitude.toFixed(4)}° E`;
+
+  try {
+    if (activeView === "satellite") {
+      map.flyTo([item.latitude, item.longitude], 12, { duration: 1.2 });
+      renderLocationPins(dbLocations, null, item);
+    } else {
+      map.setView([item.latitude, item.longitude], 12);
+      renderLocationPins(dbLocations, null, item);
+    }
+  } catch (err) {
+    console.warn("Map view update skipped (container hidden):", err);
+  }
+
+  // 2. Satellite Observations (DO NOT fabricate)
+  satelliteObservationElement.textContent = "No data available";
+  satelliteObservationElement.className = "value no-data";
+  satelliteMetaSubtitle.textContent = "NO DATABASE OBSERVATION";
+
+  // 3. Flood Detections (DO NOT fabricate)
+  floodedAreaElement.textContent = "No data available";
+  floodedAreaElement.className = "value no-data";
+  floodExtentSubtitle.textContent = "NO FLOOD RECORD AVAILABLE";
+
+  detectionConfidenceElement.textContent = "No data available";
+  detectionConfidenceElement.className = "value no-data";
+  detectionMethodSubtitle.textContent = "NO FLOOD RECORD AVAILABLE";
+
+  // 4. Flood Regions (DO NOT fabricate)
+  floodRegionsLayerGroup.clearLayers();
+  affectedRegionsElement.textContent = "No data available";
+  affectedRegionsElement.className = "value no-data";
+  if (regionsSubtitle) regionsSubtitle.textContent = "NO HISTORICAL DATABASE RECORD";
+  mapRegionStatus.textContent = "NO HISTORICAL DATABASE RECORD";
+
+  // 5. Risk Predictions (DO NOT fabricate)
+  floodRiskElement.textContent = "No data available";
+  floodRiskElement.className = "value no-data";
+  analysisStatusElement.textContent = "No risk prediction available for this location.";
+
+  riskScoreValue.textContent = "--";
+  riskLevelBadge.textContent = "N/A";
+  riskLevelBadge.className = "alert-pill pill-low";
+  riskModelName.textContent = "No risk prediction available for this location.";
+
+  const clearFactor = (el: HTMLElement | null) => {
+    if (!el) return;
+    el.textContent = "No data available";
+    el.classList.add("no-data");
+  };
+
+  clearFactor(rfRainfall);
+  clearFactor(rfAccumRain);
+  clearFactor(rfTemperature);
+  clearFactor(rfRiverDist);
+  clearFactor(rfElevation);
+  clearFactor(rfSlope);
+  clearFactor(rfNdvi);
+  clearFactor(rfNdwi);
+  clearFactor(rfFreq);
+  clearFactor(rfPriorArea);
+
+  // 6. Historical Floods & Charts (DO NOT fabricate)
+  renderHistoricalCharts([]);
+
+  // 7. Alerts (DO NOT fabricate)
+  renderAlerts([], null);
+
+  // 8. Copernicus SAR Discovery
+  loadCopernicusSarAsset(item.name);
+
+  // 9. Sentinel-1 Product Discovery with searched coordinates
+  if (activeView === "satellite") {
+    lastLoadedSatelliteLocationId = null;
+    loadSentinel1Discovery(null, item.name, item.latitude, item.longitude);
+  } else {
+    lastLoadedSatelliteLocationId = null;
+  }
+
+  // 10. Live Weather & Atmospheric Telemetry (Real live data for coordinates)
+  try {
+    const weather = await fetchLiveWeather(item.latitude, item.longitude);
+    temperatureElement.textContent = `${Math.round(weather.main.temp)}°C`;
+    conditionElement.textContent = weather.weather?.[0]?.description || "Fair";
+
+    const rainVal = weather.rain?.["1h"] ?? weather.rain?.["3h"] ?? 0;
+    rainfallElement.textContent = `${rainVal} mm`;
+    rainfallStatus.textContent = `OpenWeather live telemetry (${item.name})`;
+
+    const aqi = await fetchLiveAirQuality(item.latitude, item.longitude);
+    const aqiLabels: Record<number, string> = {
+      1: "Good",
+      2: "Fair",
+      3: "Moderate",
+      4: "Poor",
+      5: "Very Poor",
+    };
+    if (aqi) {
+      airQualityElement.textContent = aqiLabels[aqi] || "Fair";
+      airQualityStatus.textContent = `AQI Index Level ${aqi}`;
+    } else {
+      airQualityElement.textContent = "Fair";
+      airQualityStatus.textContent = "AQI Normal";
+    }
+
+    updateInsightCard(Math.round(weather.main.temp), aqi, "LOW");
+  } catch {
+    temperatureElement.textContent = "--";
+    conditionElement.textContent = "Weather API unavailable";
+    airQualityElement.textContent = "--";
+    updateInsightCard(28, null, "LOW");
+  }
+
+  // Topbar statistics sync
+  const topStatObsEl = document.querySelector<HTMLElement>("#top-stat-obs");
+  const topStatFloodsEl = document.querySelector<HTMLElement>("#top-stat-floods");
+  const topStatRiskEl = document.querySelector<HTMLElement>("#top-stat-risk");
+  const topStatAlertsEl = document.querySelector<HTMLElement>("#top-stat-alerts");
+  if (topStatObsEl) topStatObsEl.textContent = "--";
+  if (topStatFloodsEl) topStatFloodsEl.textContent = "--";
+  if (topStatRiskEl) topStatRiskEl.textContent = "--";
+  if (topStatAlertsEl) topStatAlertsEl.textContent = "0";
+
+  updateLocationObservationView();
+  updateFloodDetectionView();
+  updateFloodPipelineWorkflow();
+  updateLocationObservationWorkflow();
   renderCurrentView();
 }
 
@@ -3217,234 +3577,407 @@ function updateTopStatistics() {
 }
 
 function updateLocationObservationView() {
-  const activeLoc = dbLocations.find((l) => l.location_id === selectedLocationId) || dbLocations[0];
-  if (!activeLoc) return;
+  if (isCurrentLocationDatabaseMonitored) {
+    const activeLoc = dbLocations.find((l) => l.location_id === selectedLocationId) || dbLocations[0];
+    if (!activeLoc) return;
 
-  if (locObsSelect && locObsSelect.value !== String(activeLoc.location_id)) {
-    locObsSelect.value = String(activeLoc.location_id);
-  }
-  if (locObsMeta) locObsMeta.textContent = `${activeLoc.district}, ${activeLoc.state}`;
-  if (locObsIdBadge) locObsIdBadge.textContent = `LOC-${activeLoc.location_id}`;
-  if (locObsCoords) locObsCoords.textContent = `${activeLoc.latitude.toFixed(4)}° N, ${activeLoc.longitude.toFixed(4)}° E`;
-
-  // 1. Satellite Observations Card
-  if (locObsSatBody) {
-    const locObservations = allObservations.filter((s) => s.location_id === activeLoc.location_id);
-    if (locObservations.length > 0) {
-      locObsSatBody.innerHTML = `
-        <div style="display:flex; flex-direction:column; gap:10px;">
-          ${locObservations.map((obs) => `
-            <div class="loc-obs-metric" style="gap:6px;">
-              <div style="display:flex; justify-content:space-between; align-items:center;">
-                <strong style="color:var(--accent-cyan); font-size:13px;">${obs.satellite} • ${obs.sensor}</strong>
-                <span class="provenance-tag tag-db">${obs.data_source}</span>
-              </div>
-              <div style="font-size:11.5px; color:var(--text-secondary);">
-                <span>Acquired: <strong>${obs.acquisition_date}</strong></span>
-                ${obs.cloud_cover !== null ? `<span style="margin-left:8px;">Cloud Cover: <strong>${obs.cloud_cover}%</strong></span>` : ""}
-              </div>
-              <div style="font-size:11px; color:var(--text-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
-                Product: <code>${obs.product_id}</code>
-              </div>
-            </div>
-          `).join("")}
-        </div>
-      `;
-    } else {
-      locObsSatBody.innerHTML = `
-        <div class="state-box">
-          No satellite observations available for this location.
-        </div>
-      `;
+    if (locObsSelect && locObsSelect.value !== String(activeLoc.location_id)) {
+      locObsSelect.value = String(activeLoc.location_id);
     }
-  }
-
-  // 2. Flood Information Card
-  if (locObsFloodBody) {
-    const locFloods = allFloodDetections.filter((f) => f.location_id === activeLoc.location_id);
-    const locRegions = allFloodRegions.filter((r) => r.location_id === activeLoc.location_id);
-    if (locFloods.length > 0) {
-      locObsFloodBody.innerHTML = `
-        <div style="display:flex; flex-direction:column; gap:10px;">
-          ${locFloods.map((fl) => `
-            <div class="loc-obs-metric" style="gap:6px;">
-              <div style="display:flex; justify-content:space-between; align-items:center;">
-                <span style="font-weight:700; color:var(--text-main); font-size:13px;">${fl.satellite} ${fl.sensor}</span>
-                <span class="provenance-tag ${fl.status === "ACTIVE" ? "tag-live" : "tag-db"}">${fl.status}</span>
-              </div>
-              <div class="loc-obs-metric-grid" style="margin-top:4px;">
-                <div>
-                  <span class="card-subtitle">Inundation Area</span>
-                  <div style="font-size:14px; font-weight:700; color:var(--accent-cyan);">${fl.flooded_area_km2 ?? 0} km²</div>
-                </div>
-                <div>
-                  <span class="card-subtitle">Flood Ratio</span>
-                  <div style="font-size:14px; font-weight:700; color:var(--status-warning);">${fl.flood_percentage ?? 0}%</div>
-                </div>
-                <div>
-                  <span class="card-subtitle">Confidence</span>
-                  <div style="font-size:13px; font-weight:600;">${fl.confidence !== null ? `${Math.round(fl.confidence * 100)}%` : "N/A"}</div>
-                </div>
-                <div>
-                  <span class="card-subtitle">Detection Method</span>
-                  <div style="font-size:11.5px; color:var(--text-muted);">${fl.detection_method}</div>
-                </div>
-              </div>
-              <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">
-                Detection Date: ${fl.detection_date} • Source: ${fl.source}
-              </div>
-            </div>
-          `).join("")}
-          ${locRegions.length > 0 ? `
-            <div style="margin-top:4px; font-size:11.5px; color:var(--text-muted);">
-              <strong>Mapped Sub-regions (${locRegions.length}):</strong>
-              <div style="display:flex; flex-wrap:wrap; gap:6px; margin-top:6px;">
-                ${locRegions.map((r) => `<span class="provenance-tag tag-db">${r.region_name} (${r.affected_area_km2 ?? 0} km² · ${r.severity})</span>`).join("")}
-              </div>
-            </div>
-          ` : ""}
-        </div>
-      `;
-    } else {
-      locObsFloodBody.innerHTML = `
-        <div class="state-box">
-          No flood detection data available for this location.
-        </div>
-      `;
+    if (locObsMeta) locObsMeta.textContent = `${activeLoc.district}, ${activeLoc.state}`;
+    if (locObsIdBadge) {
+      locObsIdBadge.textContent = "DATABASE MONITORED";
+      locObsIdBadge.className = "loc-type-badge badge-db";
     }
-  }
+    if (locObsCoords) locObsCoords.textContent = `${activeLoc.latitude.toFixed(4)}° N, ${activeLoc.longitude.toFixed(4)}° E`;
 
-  // 3. Risk Information Card
-  if (locObsRiskBody) {
-    const locRisks = allRiskPredictions.filter((r) => r.location_id === activeLoc.location_id);
-    if (locRisks.length > 0) {
-      const risk = locRisks[0];
-      const scorePct = risk.risk_score !== null ? Math.round(risk.risk_score * 100) : null;
-      const pillClass = risk.risk_level === "HIGH" || risk.risk_level === "VERY HIGH" ? "pill-high" : risk.risk_level === "MEDIUM" ? "pill-medium" : "pill-low";
-      locObsRiskBody.innerHTML = `
-        <div style="display:flex; flex-direction:column; gap:10px;">
-          <div style="display:flex; justify-content:space-between; align-items:center;">
-            <div>
-              <span class="alert-pill ${pillClass}">${risk.risk_level} RISK</span>
-              <strong style="margin-left:8px; font-size:15px; color:var(--text-main);">${scorePct !== null ? `${scorePct}%` : "--"}</strong>
-            </div>
-            <span class="provenance-tag tag-proto">${risk.model_name}</span>
-          </div>
-          <div class="loc-obs-metric-grid" style="font-size:11.5px;">
-            <div class="loc-obs-metric">
-              <span class="card-subtitle">24h Rainfall</span>
-              <strong>${risk.rainfall_mm !== null ? `${risk.rainfall_mm} mm` : "N/A"}</strong>
-            </div>
-            <div class="loc-obs-metric">
-              <span class="card-subtitle">Accumulated Rain</span>
-              <strong>${risk.accumulated_rainfall_mm !== null ? `${risk.accumulated_rainfall_mm} mm` : "N/A"}</strong>
-            </div>
-            <div class="loc-obs-metric">
-              <span class="card-subtitle">River Distance</span>
-              <strong>${risk.river_distance_km !== null ? `${risk.river_distance_km} km` : "N/A"}</strong>
-            </div>
-            <div class="loc-obs-metric">
-              <span class="card-subtitle">Terrain Elevation</span>
-              <strong>${risk.elevation_m !== null ? `${risk.elevation_m} m` : "N/A"}</strong>
-            </div>
-            <div class="loc-obs-metric">
-              <span class="card-subtitle">Slope</span>
-              <strong>${risk.slope_degree !== null ? `${risk.slope_degree}°` : "N/A"}</strong>
-            </div>
-            <div class="loc-obs-metric">
-              <span class="card-subtitle">Prior Flooded Area</span>
-              <strong>${risk.previous_flooded_area_km2 !== null ? `${risk.previous_flooded_area_km2} km²` : "N/A"}</strong>
-            </div>
-          </div>
-          <div style="font-size:11px; color:var(--text-dim);">
-            Prediction Date: ${risk.prediction_date}
-          </div>
-        </div>
-      `;
-    } else {
-      locObsRiskBody.innerHTML = `
-        <div class="state-box">
-          No risk prediction data available for this location.
-        </div>
-      `;
-    }
-  }
-
-  // 4. Alerts Card
-  if (locObsAlertsBody) {
-    const locAlerts = allAlerts.filter((a) => a.location_id === activeLoc.location_id);
-    if (locAlerts.length > 0) {
-      locObsAlertsBody.innerHTML = `
-        <div style="display:flex; flex-direction:column; gap:8px;">
-          ${locAlerts.map((a) => {
-            const pillClass = a.alert_level === "HIGH" || a.alert_level === "CRITICAL" ? "pill-high" : a.alert_level === "MEDIUM" ? "pill-medium" : "pill-low";
-            return `
-              <div class="loc-obs-metric" style="gap:4px;">
+    // 1. Satellite Observations Card
+    if (locObsSatBody) {
+      const locObservations = allObservations.filter((s) => s.location_id === activeLoc.location_id);
+      if (locObservations.length > 0) {
+        locObsSatBody.innerHTML = `
+          <div style="display:flex; flex-direction:column; gap:10px;">
+            ${locObservations.map((obs) => `
+              <div class="loc-obs-metric" style="gap:6px;">
                 <div style="display:flex; justify-content:space-between; align-items:center;">
-                  <span class="alert-pill ${pillClass}">${a.alert_level} • ${a.alert_type}</span>
-                  <span style="font-size:11px; color:var(--text-dim);">${a.alert_date}</span>
+                  <strong style="color:var(--accent-cyan); font-size:13px;">${obs.satellite} • ${obs.sensor}</strong>
+                  <span style="font-size:11px; color:var(--text-secondary); font-weight:600;">Acquired: ${obs.acquisition_date}</span>
                 </div>
-                <p style="font-size:12px; color:var(--text-main); margin:3px 0 0;">${a.alert_message}</p>
-                <div style="font-size:10.5px; color:var(--text-muted);">
-                  Status: <strong>${a.is_resolved ? "Resolved" : "Active"}</strong>
+                <div style="font-size:11.5px; color:var(--text-secondary);">
+                  ${obs.cloud_cover !== null ? `<span>Cloud Cover: <strong>${obs.cloud_cover}%</strong></span>` : ""}
+                  <span style="margin-left:8px;">Source: ${obs.data_source}</span>
+                </div>
+                <div style="font-size:11px; color:var(--text-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+                  Product: <code>${obs.product_id}</code>
                 </div>
               </div>
-            `;
-          }).join("")}
+            `).join("")}
+          </div>
+        `;
+      } else {
+        locObsSatBody.innerHTML = `
+          <div class="state-box">
+            No database observation available
+          </div>
+        `;
+      }
+    }
+
+    // 2. Flood Information Card
+    if (locObsFloodBody) {
+      const locFloods = allFloodDetections.filter((f) => f.location_id === activeLoc.location_id);
+      const locRegions = allFloodRegions.filter((r) => r.location_id === activeLoc.location_id);
+      if (locFloods.length > 0) {
+        locObsFloodBody.innerHTML = `
+          <div style="display:flex; flex-direction:column; gap:10px;">
+            ${locFloods.map((fl) => `
+              <div class="loc-obs-metric" style="gap:6px;">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                  <span style="font-weight:700; color:var(--text-main); font-size:13px;">${fl.satellite} ${fl.sensor}</span>
+                  <span class="alert-pill ${fl.status === "ACTIVE" ? "pill-high" : "pill-low"}">${fl.status}</span>
+                </div>
+                <div class="loc-obs-metric-grid" style="margin-top:4px;">
+                  <div>
+                    <span class="card-subtitle">Candidate Flood Area</span>
+                    <div style="font-size:14px; font-weight:700; color:var(--accent-cyan);">${fl.flooded_area_km2 ?? 0} km²</div>
+                  </div>
+                  <div>
+                    <span class="card-subtitle">Candidate Percentage</span>
+                    <div style="font-size:14px; font-weight:700; color:var(--status-warning);">${fl.flood_percentage ?? 0}%</div>
+                  </div>
+                  <div>
+                    <span class="card-subtitle">Confidence</span>
+                    <div style="font-size:13px; font-weight:600;">${fl.confidence !== null ? `${Math.round(fl.confidence * 100)}%` : "N/A"}</div>
+                  </div>
+                  <div>
+                    <span class="card-subtitle">Detection Method</span>
+                    <div style="font-size:11.5px; color:var(--text-muted);">${fl.detection_method}</div>
+                  </div>
+                </div>
+                <div style="font-size:11px; color:var(--text-dim); margin-top:2px;">
+                  Detection Date: ${fl.detection_date}
+                </div>
+              </div>
+            `).join("")}
+            ${locRegions.length > 0 ? `
+              <div style="margin-top:4px; font-size:11.5px; color:var(--text-muted);">
+                <strong>Mapped Sub-regions (${locRegions.length}):</strong>
+                <div style="display:flex; flex-wrap:wrap; gap:6px; margin-top:6px;">
+                  ${locRegions.map((r) => `<span class="provenance-tag tag-db">${r.region_name} (${r.affected_area_km2 ?? 0} km² · ${r.severity})</span>`).join("")}
+                </div>
+              </div>
+            ` : ""}
+          </div>
+        `;
+      } else {
+        locObsFloodBody.innerHTML = `
+          <div class="state-box">
+            No database observation available
+          </div>
+        `;
+      }
+    }
+
+    // 3. Risk Information Card
+    if (locObsRiskBody) {
+      const locRisks = allRiskPredictions.filter((r) => r.location_id === activeLoc.location_id);
+      if (locRisks.length > 0) {
+        const risk = locRisks[0];
+        const scorePct = risk.risk_score !== null ? Math.round(risk.risk_score * 100) : null;
+        const pillClass = risk.risk_level === "HIGH" || risk.risk_level === "VERY HIGH" ? "pill-high" : risk.risk_level === "MEDIUM" ? "pill-medium" : "pill-low";
+        locObsRiskBody.innerHTML = `
+          <div style="display:flex; flex-direction:column; gap:10px;">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <div>
+                <span class="alert-pill ${pillClass}">${risk.risk_level} RISK</span>
+                <strong style="margin-left:8px; font-size:15px; color:var(--text-main);">${scorePct !== null ? `${scorePct}%` : "--"}</strong>
+              </div>
+              <span style="font-size:11px; color:var(--text-muted); font-weight:600;">Model: ${risk.model_name}</span>
+            </div>
+            <div class="loc-obs-metric-grid" style="font-size:11.5px;">
+              <div class="loc-obs-metric">
+                <span class="card-subtitle">24h Rainfall</span>
+                <strong>${risk.rainfall_mm !== null ? `${risk.rainfall_mm} mm` : "N/A"}</strong>
+              </div>
+              <div class="loc-obs-metric">
+                <span class="card-subtitle">Accumulated Rain</span>
+                <strong>${risk.accumulated_rainfall_mm !== null ? `${risk.accumulated_rainfall_mm} mm` : "N/A"}</strong>
+              </div>
+              <div class="loc-obs-metric">
+                <span class="card-subtitle">River Distance</span>
+                <strong>${risk.river_distance_km !== null ? `${risk.river_distance_km} km` : "N/A"}</strong>
+              </div>
+              <div class="loc-obs-metric">
+                <span class="card-subtitle">Terrain Elevation</span>
+                <strong>${risk.elevation_m !== null ? `${risk.elevation_m} m` : "N/A"}</strong>
+              </div>
+              <div class="loc-obs-metric">
+                <span class="card-subtitle">Slope</span>
+                <strong>${risk.slope_degree !== null ? `${risk.slope_degree}°` : "N/A"}</strong>
+              </div>
+              <div class="loc-obs-metric">
+                <span class="card-subtitle">Prior Flooded Area</span>
+                <strong>${risk.previous_flooded_area_km2 !== null ? `${risk.previous_flooded_area_km2} km²` : "N/A"}</strong>
+              </div>
+            </div>
+            <div style="font-size:11px; color:var(--text-dim);">
+              Prediction Date: ${risk.prediction_date}
+            </div>
+          </div>
+        `;
+      } else {
+        locObsRiskBody.innerHTML = `
+          <div class="state-box">
+            No database observation available
+          </div>
+        `;
+      }
+    }
+
+    // 4. Alerts Card
+    if (locObsAlertsBody) {
+      const locAlerts = allAlerts.filter((a) => a.location_id === activeLoc.location_id);
+      if (locAlerts.length > 0) {
+        locObsAlertsBody.innerHTML = `
+          <div style="display:flex; flex-direction:column; gap:8px;">
+            ${locAlerts.map((a) => {
+              const pillClass = a.alert_level === "HIGH" || a.alert_level === "CRITICAL" ? "pill-high" : a.alert_level === "MEDIUM" ? "pill-medium" : "pill-low";
+              return `
+                <div class="loc-obs-metric" style="gap:4px;">
+                  <div style="display:flex; justify-content:space-between; align-items:center;">
+                    <span class="alert-pill ${pillClass}">${a.alert_level} • ${a.alert_type}</span>
+                    <span style="font-size:11px; color:var(--text-dim);">${a.alert_date}</span>
+                  </div>
+                  <p style="font-size:12px; color:var(--text-main); margin:3px 0 0;">${a.alert_message}</p>
+                  <div style="font-size:10.5px; color:var(--text-muted);">
+                    Status: <strong>${a.is_resolved ? "Resolved" : "Active"}</strong>
+                  </div>
+                </div>
+              `;
+            }).join("")}
+          </div>
+        `;
+      } else {
+        locObsAlertsBody.innerHTML = `
+          <div class="state-box">
+            No active alerts for this location.
+          </div>
+        `;
+      }
+    }
+
+    // 5. Status & Telemetry Card
+    if (locObsStatusBody) {
+      locObsStatusBody.innerHTML = `
+        <div class="loc-obs-metric-grid" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));">
+          <div class="loc-obs-metric">
+            <span class="card-subtitle">Coordinates</span>
+            <strong style="font-size:12.5px; color:var(--text-main);">${activeLoc.latitude.toFixed(4)}° N, ${activeLoc.longitude.toFixed(4)}° E</strong>
+          </div>
+          <div class="loc-obs-metric">
+            <span class="card-subtitle">Temperature</span>
+            <strong style="font-size:12.5px; color:var(--accent-cyan);">${temperatureElement.textContent || "--"}</strong>
+          </div>
+          <div class="loc-obs-metric">
+            <span class="card-subtitle">Weather Condition</span>
+            <strong style="font-size:12.5px; color:var(--text-main);">${conditionElement.textContent || "--"}</strong>
+          </div>
+          <div class="loc-obs-metric">
+            <span class="card-subtitle">Precipitation Depth</span>
+            <strong style="font-size:12.5px; color:var(--text-main);">${rainfallElement.textContent || "--"}</strong>
+          </div>
+          <div class="loc-obs-metric">
+            <span class="card-subtitle">Air Quality</span>
+            <strong style="font-size:12.5px; color:var(--text-main);">${airQualityElement.textContent || "--"}</strong>
+          </div>
+          <div class="loc-obs-metric">
+            <span class="card-subtitle">Telemetry State</span>
+            <strong style="font-size:12.5px; color:#10b981;">● Connected / Live Telemetry</strong>
+          </div>
         </div>
       `;
-    } else {
+    }
+
+  } else {
+    // SEARCHED LOCATION: DO NOT FABRICATE DATA
+    const loc = currentSearchedLocation || {
+      name: selectedLocationName,
+      latitude: selectedLatitude,
+      longitude: selectedLongitude,
+      district: "",
+      state: "",
+      country: "",
+    };
+
+    if (locObsMeta) locObsMeta.textContent = `${loc.district || loc.name}, ${loc.state || loc.country || "Global"}`;
+    if (locObsIdBadge) {
+      locObsIdBadge.textContent = "SEARCHED LOCATION";
+      locObsIdBadge.className = "loc-type-badge badge-searched";
+    }
+    if (locObsCoords) locObsCoords.textContent = `${loc.latitude.toFixed(4)}° N, ${loc.longitude.toFixed(4)}° E`;
+
+    if (locObsSatBody) {
+      locObsSatBody.innerHTML = `
+        <div class="state-box">
+          No database observation available
+        </div>
+      `;
+    }
+    if (locObsFloodBody) {
+      locObsFloodBody.innerHTML = `
+        <div class="state-box">
+          No database observation available
+        </div>
+      `;
+    }
+    if (locObsRiskBody) {
+      locObsRiskBody.innerHTML = `
+        <div class="state-box">
+          No database observation available
+        </div>
+      `;
+    }
+    if (locObsAlertsBody) {
       locObsAlertsBody.innerHTML = `
         <div class="state-box">
           No active alerts for this location.
         </div>
       `;
     }
+    if (locObsStatusBody) {
+      locObsStatusBody.innerHTML = `
+        <div class="loc-obs-metric-grid" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));">
+          <div class="loc-obs-metric">
+            <span class="card-subtitle">Coordinates</span>
+            <strong style="font-size:12.5px; color:var(--text-main);">${loc.latitude.toFixed(4)}° N, ${loc.longitude.toFixed(4)}° E</strong>
+          </div>
+          <div class="loc-obs-metric">
+            <span class="card-subtitle">Temperature</span>
+            <strong style="font-size:12.5px; color:var(--accent-cyan);">${temperatureElement.textContent || "--"}</strong>
+          </div>
+          <div class="loc-obs-metric">
+            <span class="card-subtitle">Weather Condition</span>
+            <strong style="font-size:12.5px; color:var(--text-main);">${conditionElement.textContent || "--"}</strong>
+          </div>
+          <div class="loc-obs-metric">
+            <span class="card-subtitle">Precipitation Depth</span>
+            <strong style="font-size:12.5px; color:var(--text-main);">${rainfallElement.textContent || "--"}</strong>
+          </div>
+          <div class="loc-obs-metric">
+            <span class="card-subtitle">Air Quality</span>
+            <strong style="font-size:12.5px; color:var(--text-main);">${airQualityElement.textContent || "--"}</strong>
+          </div>
+          <div class="loc-obs-metric">
+            <span class="card-subtitle">Telemetry State</span>
+            <strong style="font-size:12.5px; color:#10b981;">● Connected / Live Telemetry</strong>
+          </div>
+        </div>
+      `;
+    }
   }
 
-  // 5. Status & Telemetry Card
-  if (locObsStatusBody) {
-    locObsStatusBody.innerHTML = `
-      <div class="loc-obs-metric-grid" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));">
-        <div class="loc-obs-metric">
-          <span class="card-subtitle">Coordinates</span>
-          <strong style="font-size:12.5px; color:var(--text-main);">${activeLoc.latitude.toFixed(4)}° N, ${activeLoc.longitude.toFixed(4)}° E</strong>
-        </div>
-        <div class="loc-obs-metric">
-          <span class="card-subtitle">Temperature</span>
-          <strong style="font-size:12.5px; color:var(--accent-cyan);">${temperatureElement.textContent || "--"}</strong>
-        </div>
-        <div class="loc-obs-metric">
-          <span class="card-subtitle">Weather Condition</span>
-          <strong style="font-size:12.5px; color:var(--text-main);">${conditionElement.textContent || "--"}</strong>
-        </div>
-        <div class="loc-obs-metric">
-          <span class="card-subtitle">Precipitation Depth</span>
-          <strong style="font-size:12.5px; color:var(--text-main);">${rainfallElement.textContent || "--"}</strong>
-        </div>
-        <div class="loc-obs-metric">
-          <span class="card-subtitle">Air Quality</span>
-          <strong style="font-size:12.5px; color:var(--text-main);">${airQualityElement.textContent || "--"}</strong>
-        </div>
-        <div class="loc-obs-metric">
-          <span class="card-subtitle">Telemetry State</span>
-          <strong style="font-size:12.5px; color:#10b981;">● Connected / Live</strong>
-        </div>
-      </div>
-    `;
+  updateLocationObservationWorkflow();
+}
+
+function updateLocationObservationWorkflow() {
+  const stageBadge = document.querySelector<HTMLElement>("#loc-obs-pipeline-current-stage");
+  const searchNode = document.querySelector<HTMLElement>("#lo-stage-search");
+  const coordsNode = document.querySelector<HTMLElement>("#lo-stage-coords");
+  const mapNode = document.querySelector<HTMLElement>("#lo-stage-map");
+  const satNode = document.querySelector<HTMLElement>("#lo-stage-sat");
+  const envNode = document.querySelector<HTMLElement>("#lo-stage-env");
+  const riskNode = document.querySelector<HTMLElement>("#lo-stage-risk");
+  const assessNode = document.querySelector<HTMLElement>("#lo-stage-assessment");
+
+  const setNode = (node: HTMLElement | null, status: "completed" | "active" | "pending") => {
+    if (!node) return;
+    node.classList.remove("completed", "active");
+    const icon = node.querySelector<HTMLElement>(".pipeline-node-icon");
+    if (status === "completed") {
+      node.classList.add("completed");
+      if (icon) icon.textContent = "✓";
+    } else if (status === "active") {
+      node.classList.add("active");
+      if (icon) icon.textContent = "●";
+    } else {
+      if (icon) icon.textContent = "○";
+    }
+  };
+
+  // Stage 1: Location Search is completed
+  setNode(searchNode, "completed");
+
+  // Stage 2: Geographic Coordinates is completed
+  setNode(coordsNode, "completed");
+
+  // Stage 3: Map Observation is completed
+  setNode(mapNode, "completed");
+
+  // Stage 4: Satellite Observation
+  const hasDbSat = isCurrentLocationDatabaseMonitored &&
+    allObservations.some((s) => s.location_id === selectedLocationId);
+  const hasS1Prod = Boolean(selectedSentinel1Product);
+  if (hasDbSat || hasS1Prod) {
+    setNode(satNode, "completed");
+  } else {
+    setNode(satNode, "pending");
+  }
+
+  // Stage 5: Environmental Conditions
+  const hasWeather =
+    temperatureElement?.textContent &&
+    temperatureElement.textContent !== "--" &&
+    !temperatureElement.classList.contains("no-data");
+  if (hasWeather) {
+    setNode(envNode, "completed");
+  } else {
+    setNode(envNode, "active");
+  }
+
+  // Stage 6: Flood / Risk Context
+  const hasFloodOrRisk =
+    isCurrentLocationDatabaseMonitored &&
+    (allFloodDetections.some((f) => f.location_id === selectedLocationId) ||
+      allRiskPredictions.some((r) => r.location_id === selectedLocationId));
+  if (hasFloodOrRisk) {
+    setNode(riskNode, "completed");
+  } else {
+    setNode(riskNode, "pending");
+  }
+
+  // Stage 7: Disaster Assessment
+  const hasAlerts =
+    isCurrentLocationDatabaseMonitored &&
+    allAlerts.some((a) => a.location_id === selectedLocationId);
+  if (hasAlerts) {
+    setNode(assessNode, "completed");
+  } else {
+    setNode(assessNode, "pending");
+  }
+
+  if (stageBadge) {
+    if (isCurrentLocationDatabaseMonitored) {
+      stageBadge.textContent = "✓ Site Telemetry & Database Connected";
+    } else {
+      stageBadge.textContent = "● Searched Site Telemetry Active";
+    }
   }
 }
 
 function updateFloodDetectionView() {
   if (floodCtrlLocation) {
-    floodCtrlLocation.textContent = `${selectedLocationName} (ID: ${selectedLocationId})`;
+    const locBadge = isCurrentLocationDatabaseMonitored
+      ? "(DATABASE MONITORED)"
+      : "(SEARCHED LOCATION)";
+    floodCtrlLocation.textContent = `${selectedLocationName} ${locBadge}`;
   }
   if (floodCtrlProductId) {
     if (selectedSentinel1Product && selectedSentinel1Product.product_id) {
       floodCtrlProductId.textContent = selectedSentinel1Product.product_id;
       floodCtrlProductId.title = selectedSentinel1Product.product_id;
     } else {
-      floodCtrlProductId.textContent = "No product selected — choose a Sentinel-1 product from the Satellite page";
+      floodCtrlProductId.textContent =
+        "No product selected — choose a Sentinel-1 product from the Satellite page";
       floodCtrlProductId.title = "";
     }
   }
@@ -3457,6 +3990,193 @@ function updateFloodDetectionView() {
   } else {
     if (emptyResultsState) emptyResultsState.style.display = "none";
     if (activeResultsContent) activeResultsContent.style.display = "block";
+  }
+
+  // Populate Footprint & Detection Summary Card
+  const summaryEl = document.querySelector<HTMLElement>("#flood-footprint-summary-content");
+  if (summaryEl) {
+    const isFloodDetected = Boolean(
+      selectedSentinel1FloodStatus?.detected_metadata &&
+        Object.keys(selectedSentinel1FloodStatus.detected_metadata).length > 0
+    );
+    const pols = isFloodDetected && selectedSentinel1FloodStatus?.detected_metadata
+      ? Object.keys(selectedSentinel1FloodStatus.detected_metadata)
+      : [];
+    const floodMeta = isFloodDetected && selectedSentinel1FloodStatus?.detected_metadata && pols.length > 0
+      ? selectedSentinel1FloodStatus.detected_metadata[pols[0]]
+      : null;
+    const bounds = floodMeta?.bounds ? `[${floodMeta.bounds.map((b) => Number(b).toFixed(4)).join(", ")}]` : "--";
+
+    summaryEl.innerHTML = `
+      <div style="display:flex; flex-direction:column; gap:12px;">
+        <div class="loc-obs-metric">
+          <span class="card-subtitle">Active Location Context</span>
+          <div style="display:flex; align-items:center; justify-content:space-between; margin-top:2px;">
+            <strong style="color:var(--text-main); font-size:13px;">${selectedLocationName}</strong>
+            <span class="loc-type-badge ${isCurrentLocationDatabaseMonitored ? "badge-db" : "badge-searched"}">
+              ${isCurrentLocationDatabaseMonitored ? "DATABASE MONITORED" : "SEARCHED LOCATION"}
+            </span>
+          </div>
+          <span style="font-size:11px; color:var(--text-muted);">${selectedLatitude.toFixed(4)}° N, ${selectedLongitude.toFixed(4)}° E</span>
+        </div>
+
+        <div class="loc-obs-metric">
+          <span class="card-subtitle">Active Sentinel-1 Product</span>
+          <code style="font-size:11px; color:var(--accent-cyan); display:block; word-break:break-all; margin-top:2px;">
+            ${selectedSentinel1Product?.product_id || "None selected"}
+          </code>
+        </div>
+
+        <div class="loc-obs-metric">
+          <span class="card-subtitle">Footprint Spatial Bounds</span>
+          <code style="font-size:10.5px; color:var(--text-secondary); display:block; margin-top:2px;">${bounds}</code>
+        </div>
+
+        <div class="loc-obs-metric">
+          <span class="card-subtitle">Low-Backscatter Candidate Mask Status</span>
+          <div style="font-size:12px; margin-top:3px; color:${isFloodDetected ? "#10b981" : "var(--text-muted)"}; font-weight:600;">
+            ${
+              isFloodDetected
+                ? `✓ Generated: ${floodMeta?.detected_area_km2 ?? 0} km² (${floodMeta?.flood_percentage ?? 0}%)`
+                : "Awaiting detection run"
+            }
+          </div>
+        </div>
+
+        <div style="margin-top:6px; display:flex; gap:8px;">
+          <button type="button" class="action-btn" id="btn-focus-footprint" style="padding:6px 14px; font-size:11.5px; width:100%;">
+            🔍 Focus Centroid on Map
+          </button>
+        </div>
+      </div>
+    `;
+
+    summaryEl.querySelector("#btn-focus-footprint")?.addEventListener("click", () => {
+      switchView("satellite");
+      map.flyTo([selectedLatitude, selectedLongitude], 12, { duration: 1.2 });
+    });
+  }
+
+  updateFloodPipelineWorkflow();
+}
+
+function updateFloodPipelineWorkflow() {
+  const currentStageBadge = document.querySelector<HTMLElement>("#flood-pipeline-current-stage");
+  const s1Node = document.querySelector<HTMLElement>("#f-stage-s1");
+  const prodNode = document.querySelector<HTMLElement>("#f-stage-product");
+  const dlNode = document.querySelector<HTMLElement>("#f-stage-download");
+  const preNode = document.querySelector<HTMLElement>("#f-stage-preprocess");
+  const polNode = document.querySelector<HTMLElement>("#f-stage-polarization");
+  const threshNode = document.querySelector<HTMLElement>("#f-stage-threshold");
+  const maskNode = document.querySelector<HTMLElement>("#f-stage-mask");
+  const areaNode = document.querySelector<HTMLElement>("#f-stage-area");
+  const analysisNode = document.querySelector<HTMLElement>("#f-stage-analysis");
+
+  const setNode = (node: HTMLElement | null, status: "completed" | "active" | "pending") => {
+    if (!node) return;
+    node.classList.remove("completed", "active");
+    const icon = node.querySelector<HTMLElement>(".pipeline-node-icon");
+    if (status === "completed") {
+      node.classList.add("completed");
+      if (icon) icon.textContent = "✓";
+    } else if (status === "active") {
+      node.classList.add("active");
+      if (icon) icon.textContent = "●";
+    } else {
+      if (icon) icon.textContent = "○";
+    }
+  };
+
+  // Stage 1: Sentinel-1 SAR is completed
+  setNode(s1Node, "completed");
+
+  const hasProduct = Boolean(selectedSentinel1Product && selectedSentinel1Product.product_id);
+  const isDownloaded = Boolean(
+    selectedSentinel1Product?.download_status === "DOWNLOADED" ||
+      (selectedSentinel1SarStatus?.processed_metadata &&
+        Object.keys(selectedSentinel1SarStatus.processed_metadata).length > 0) ||
+      (selectedSentinel1FloodStatus?.detected_metadata &&
+        Object.keys(selectedSentinel1FloodStatus.detected_metadata).length > 0)
+  );
+  const isPreprocessed = Boolean(
+    selectedSentinel1SarStatus?.processed_metadata &&
+      Object.keys(selectedSentinel1SarStatus.processed_metadata).length > 0
+  );
+  const isFloodDetected = Boolean(
+    selectedSentinel1FloodStatus?.detected_metadata &&
+      Object.keys(selectedSentinel1FloodStatus.detected_metadata).length > 0
+  );
+
+  // Stage 2: Product Selection
+  setNode(prodNode, hasProduct ? "completed" : "active");
+
+  // Stage 3: Download
+  if (isDownloaded) {
+    setNode(dlNode, "completed");
+  } else if (hasProduct) {
+    setNode(dlNode, "active");
+  } else {
+    setNode(dlNode, "pending");
+  }
+
+  // Stage 4: SAR Preprocessing
+  if (isPreprocessed) {
+    setNode(preNode, "completed");
+  } else if (isDownloaded) {
+    setNode(preNode, "active");
+  } else {
+    setNode(preNode, "pending");
+  }
+
+  // Stage 5: VV / VH Data
+  if (isPreprocessed) {
+    setNode(polNode, "completed");
+  } else {
+    setNode(polNode, "pending");
+  }
+
+  // Stage 6: Backscatter Threshold
+  if (isFloodDetected) {
+    setNode(threshNode, "completed");
+  } else if (isPreprocessed) {
+    setNode(threshNode, "active");
+  } else {
+    setNode(threshNode, "pending");
+  }
+
+  // Stage 7: Candidate Flood Mask
+  if (isFloodDetected) {
+    setNode(maskNode, "completed");
+  } else {
+    setNode(maskNode, "pending");
+  }
+
+  // Stage 8: Area Calculation
+  if (isFloodDetected) {
+    setNode(areaNode, "completed");
+  } else {
+    setNode(areaNode, "pending");
+  }
+
+  // Stage 9: Flood Analysis
+  if (isFloodDetected) {
+    setNode(analysisNode, "completed");
+  } else {
+    setNode(analysisNode, "pending");
+  }
+
+  if (currentStageBadge) {
+    if (isFloodDetected) {
+      currentStageBadge.textContent = "✓ Candidate Mask & Analysis Complete";
+    } else if (isPreprocessed) {
+      currentStageBadge.textContent = "● Backscatter Threshold Ready";
+    } else if (isDownloaded) {
+      currentStageBadge.textContent = "● SAR Preprocessing Ready";
+    } else if (hasProduct) {
+      currentStageBadge.textContent = "● Download / SAR Ready";
+    } else {
+      currentStageBadge.textContent = "● Product Selection";
+    }
   }
 }
 
@@ -4034,20 +4754,20 @@ function renderGlobalProcessingResults(
 
       <div class="proc-results-grid">
         <div class="proc-metric-box">
-          <span class="proc-metric-label">Method</span>
-          <span class="proc-metric-value" style="font-size:11px;">Prototype SAR Flood Detection</span>
+          <span class="proc-metric-label">Selected Location</span>
+          <span class="proc-metric-value" style="font-size:12px; color:var(--accent-cyan);">${selectedLocationName}</span>
+        </div>
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">Selected Sentinel-1 Product</span>
+          <span class="proc-metric-value" style="font-size:10px; word-break:break-all;">${meta.product_id}</span>
         </div>
         <div class="proc-metric-box">
           <span class="proc-metric-label">Polarization</span>
           <span class="proc-metric-value">${meta.polarization || currentPol}</span>
         </div>
         <div class="proc-metric-box">
-          <span class="proc-metric-label">Threshold Used (DN)</span>
-          <span class="proc-metric-value">${meta.threshold_used ?? "--"}</span>
-        </div>
-        <div class="proc-metric-box">
-          <span class="proc-metric-label">Detection Status</span>
-          <span class="proc-metric-value" style="color:var(--status-success);">${meta.processing_status || "COMPLETED"}</span>
+          <span class="proc-metric-label">Threshold</span>
+          <span class="proc-metric-value">${meta.threshold_used ?? "--"} DN</span>
         </div>
 
         <div class="proc-metric-box">
@@ -4055,7 +4775,7 @@ function renderGlobalProcessingResults(
           <span class="proc-metric-value" style="color:#38bdf8;">${meta.detected_area_km2 ?? "--"} km²</span>
         </div>
         <div class="proc-metric-box">
-          <span class="proc-metric-label">Affected Area</span>
+          <span class="proc-metric-label">Candidate Percentage</span>
           <span class="proc-metric-value" style="color:#f59e0b;">${meta.flood_percentage ?? "--"}%</span>
         </div>
         <div class="proc-metric-box">
@@ -4063,39 +4783,34 @@ function renderGlobalProcessingResults(
           <span class="proc-metric-value">${meta.candidate_flood_pixels?.toLocaleString() ?? meta.flood_pixel_count?.toLocaleString() ?? "--"}</span>
         </div>
         <div class="proc-metric-box">
-          <span class="proc-metric-label">Valid Analyzed Pixels</span>
+          <span class="proc-metric-label">Valid Pixels</span>
           <span class="proc-metric-value">${meta.valid_pixels?.toLocaleString() ?? meta.valid_pixel_count?.toLocaleString() ?? "--"}</span>
         </div>
 
         <div class="proc-metric-box">
-          <span class="proc-metric-label">Analyzed Area</span>
-          <span class="proc-metric-value">${meta.analyzed_area_km2 ?? "--"} km²</span>
+          <span class="proc-metric-label">Processing Status</span>
+          <span class="proc-metric-value" style="color:var(--status-success);">${meta.processing_status || "COMPLETED"}</span>
+        </div>
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">Detection Result</span>
+          <span class="proc-metric-value" style="font-size:11px; color:#38bdf8;">Low-Backscatter Candidate Mask</span>
+        </div>
+        <div class="proc-metric-box">
+          <span class="proc-metric-label">Map / Footprint</span>
+          <span class="proc-metric-value" style="font-size:10.5px;">${meta.bounds ? `[${meta.bounds.map((b: any) => Number(b).toFixed(3)).join(", ")}]` : (meta.crs || "--")}</span>
         </div>
         <div class="proc-metric-box">
           <span class="proc-metric-label">Raster Dimensions</span>
           <span class="proc-metric-value">${meta.width ?? "--"} × ${meta.height ?? "--"} px</span>
         </div>
-        <div class="proc-metric-box">
-          <span class="proc-metric-label">Spatial CRS</span>
-          <span class="proc-metric-value" style="font-size:11px;">${meta.crs || "--"}</span>
-        </div>
-        <div class="proc-metric-box">
-          <span class="proc-metric-label">NoData Value</span>
-          <span class="proc-metric-value">${meta.nodata ?? -9999}</span>
-        </div>
 
         <div class="proc-file-row">
-          <span class="proc-metric-label">Flood Mask GeoTIFF Raster</span>
+          <span class="proc-metric-label">Candidate Mask GeoTIFF</span>
           <code style="font-size:10.5px; color:var(--accent-blue); word-break:break-all;">${meta.output_file || "--"}</code>
         </div>
 
-        <div class="proc-file-row">
-          <span class="proc-metric-label">Area Calculation Method</span>
-          <code style="font-size:10.5px; color:var(--accent-cyan);">${meta.area_calculation_method || "WGS-84 Ellipsoidal Geodesic Pixel Area"}</code>
-        </div>
-
-        <div class="proc-disclaimer-note" style="border-left-color:#f59e0b; background:rgba(245, 158, 11, 0.08); color:var(--text-secondary);">
-          <strong>Prototype Notice:</strong> Potential Flood / Low-Backscatter Candidate Mask. This is not scientifically validated flood classification. No radiometric calibration, terrain correction, or speckle filtering applied.
+        <div class="proc-disclaimer-note" style="border-left-color:#00f0ff; background:rgba(0, 240, 255, 0.06); color:var(--text-secondary); width:100%;">
+          Prototype SAR thresholding identifies low-backscatter candidate areas and is not a scientifically validated flood classification.
         </div>
       </div>
     `;
@@ -4740,7 +5455,7 @@ function openSentinel1DownloadModal(product: Sentinel1Product) {
 
 async function handleInitiateSentinel1Download(
   productId: string,
-  locationId: number,
+  locationId: number | null,
   cardIndex: number
 ) {
   if (isDownloadingSentinel1) {
@@ -4999,8 +5714,10 @@ function renderSarProcessResults(
 }
 
 async function loadSentinel1Discovery(
-  locationId: number,
-  locationName: string
+  locationId: number | null,
+  locationName: string,
+  lat?: number,
+  lon?: number
 ) {
   const container = document.querySelector<HTMLElement>("#s1-products-container");
   const locationNameEl = document.querySelector<HTMLElement>("#s1-location-name");
@@ -5022,7 +5739,7 @@ async function loadSentinel1Discovery(
   `;
 
   try {
-    const data = await fetchSentinel1Products(locationId, 7);
+    const data = await fetchSentinel1Products(locationId, 7, lat, lon, locationName);
     renderSentinel1Products(data);
   } catch (err: any) {
     if (statusBar) {
@@ -5035,7 +5752,7 @@ async function loadSentinel1Discovery(
 
     if (err?.response?.status === 404) {
       errorMsg = "Location not found.";
-      detail = `No Locations record for location_id=${locationId}.`;
+      detail = locationId ? `No Locations record for location_id=${locationId}.` : "Searched location has no scenes available.";
     } else if (err?.response?.status === 502) {
       errorMsg = "Unable to retrieve Sentinel-1 products from Copernicus Data Space.";
       detail = err?.response?.data?.detail || "";
@@ -5758,8 +6475,29 @@ function buildReportHtml(reportResponse: any): string {
   `;
 }
 
-async function loadPageReport(locationId: number, productId?: string | null) {
+async function loadPageReport(locationId: number | null, productId?: string | null) {
   if (!pageReportContent) return;
+
+  if (locationId === null || !isCurrentLocationDatabaseMonitored) {
+    pageReportContent.innerHTML = `
+      <div class="state-box" style="padding: 40px 20px; text-align: center;">
+        <div style="font-size: 32px; margin-bottom: 12px;">📑</div>
+        <div style="font-size: 16px; font-weight: 700; color: var(--text-main); margin-bottom: 6px;">
+          SEARCHED GEOGRAPHIC LOCATION DOSSIER
+        </div>
+        <div style="font-size: 12px; color: var(--text-secondary); max-width: 540px; margin: 0 auto 18px auto; line-height: 1.6;">
+          <strong>${selectedLocationName}</strong> is an ad-hoc searched geographic location (${selectedLatitude.toFixed(4)}° N, ${selectedLongitude.toFixed(4)}° E). Official database-monitored historical records and risk classifications are not fabricated for non-database locations.
+        </div>
+        <div style="display: flex; justify-content: center; gap: 8px; flex-wrap: wrap;">
+          <span class="loc-type-badge badge-searched">NO DATABASE OBSERVATION</span>
+          <span class="loc-type-badge badge-searched">NO FLOOD RECORD AVAILABLE</span>
+          <span class="loc-type-badge badge-searched">NO HISTORICAL DATABASE RECORD</span>
+          <span class="loc-type-badge badge-searched">NO ACTIVE ALERT</span>
+        </div>
+      </div>
+    `;
+    return;
+  }
 
   pageReportContent.innerHTML = `
     <div class="state-box">
@@ -5815,6 +6553,28 @@ export async function openReportDossier() {
   if (!reportModal || !reportModalContent) return;
 
   reportModal.style.display = "flex";
+
+  if (selectedLocationId === null || !isCurrentLocationDatabaseMonitored) {
+    reportModalContent.innerHTML = `
+      <div class="state-box" style="padding: 40px 20px; text-align: center;">
+        <div style="font-size: 32px; margin-bottom: 12px;">📑</div>
+        <div style="font-size: 16px; font-weight: 700; color: var(--text-main); margin-bottom: 6px;">
+          SEARCHED GEOGRAPHIC LOCATION DOSSIER
+        </div>
+        <div style="font-size: 12px; color: var(--text-secondary); max-width: 540px; margin: 0 auto 18px auto; line-height: 1.6;">
+          <strong>${selectedLocationName}</strong> is an ad-hoc searched geographic location (${selectedLatitude.toFixed(4)}° N, ${selectedLongitude.toFixed(4)}° E). Official database-monitored historical records and risk classifications are not fabricated for non-database locations.
+        </div>
+        <div style="display: flex; justify-content: center; gap: 8px; flex-wrap: wrap;">
+          <span class="loc-type-badge badge-searched">NO DATABASE OBSERVATION</span>
+          <span class="loc-type-badge badge-searched">NO FLOOD RECORD AVAILABLE</span>
+          <span class="loc-type-badge badge-searched">NO HISTORICAL DATABASE RECORD</span>
+          <span class="loc-type-badge badge-searched">NO ACTIVE ALERT</span>
+        </div>
+      </div>
+    `;
+    return;
+  }
+
   reportModalContent.innerHTML = `
     <div class="state-box">
       <div class="state-loading">
@@ -6105,51 +6865,261 @@ function displaySatelliteImages(data: any) {
 // EVENT LISTENERS & INITIALIZATION
 // ======================================================
 
-// Database Location Select
+// ======================================================
+// DYNAMIC MONITORED LOCATION SEARCH COMBOBOX
+// ======================================================
+
+function initLocationSearchCombobox() {
+  const inputEl = document.querySelector<HTMLInputElement>("#topbar-location-input");
+  const dropdownEl = document.querySelector<HTMLElement>("#location-search-dropdown");
+  if (!inputEl || !dropdownEl) return;
+
+  let debounceTimer: any = null;
+  let currentResults: SearchedLocation[] = [];
+  let highlightedIndex: number = -1;
+
+  const renderDropdownItems = (items: SearchedLocation[]) => {
+    currentResults = items;
+    highlightedIndex = -1;
+
+    if (!items || items.length === 0) {
+      dropdownEl.innerHTML = `<div class="location-dropdown-empty">No locations found</div>`;
+      dropdownEl.style.display = "block";
+      return;
+    }
+
+    dropdownEl.innerHTML = items
+      .map((item, idx) => {
+        const isDb = item.is_database_monitored;
+        const sub = [item.district, item.state, item.country].filter(Boolean).join(", ");
+        return `
+          <div class="location-dropdown-item" data-index="${idx}">
+            <div class="location-dropdown-item-top">
+              <span class="location-dropdown-name">${item.name}</span>
+              <span class="loc-type-badge ${isDb ? "badge-db" : "badge-searched"}">
+                ${isDb ? "DATABASE MONITORED" : "SEARCHED LOCATION"}
+              </span>
+            </div>
+            <div class="location-dropdown-sub">${sub || `${item.latitude.toFixed(3)}°, ${item.longitude.toFixed(3)}°`}</div>
+          </div>
+        `;
+      })
+      .join("");
+
+    dropdownEl.querySelectorAll<HTMLElement>(".location-dropdown-item").forEach((el) => {
+      el.addEventListener("mousedown", (e) => {
+        e.preventDefault();
+        const idx = Number(el.getAttribute("data-index"));
+        const selected = currentResults[idx];
+        if (selected) {
+          selectItem(selected);
+        }
+      });
+    });
+
+    dropdownEl.style.display = "block";
+  };
+
+  const selectItem = (item: SearchedLocation) => {
+    dropdownEl.style.display = "none";
+    inputEl.value = item.display_name || (item.district ? `${item.name} (${item.district})` : item.name);
+
+    if (item.is_database_monitored && item.location_id) {
+      selectMonitoredLocation(item.location_id);
+    } else {
+      selectSearchedGeographicLocation(item);
+    }
+  };
+
+  const showDefaultMonitoredList = () => {
+    const dbItems: SearchedLocation[] = dbLocations.map((loc) => ({
+      name: loc.location_name,
+      district: loc.district,
+      state: loc.state,
+      country: "India",
+      display_name: `${loc.location_name} (${loc.district})`,
+      latitude: loc.latitude,
+      longitude: loc.longitude,
+      is_database_monitored: true,
+      location_id: loc.location_id,
+      badge: "DATABASE MONITORED",
+    }));
+    renderDropdownItems(dbItems);
+  };
+
+  inputEl.addEventListener("focus", () => {
+    const q = inputEl.value.trim();
+    if (!q || dbLocations.some((l) => l.location_name.toLowerCase() === q.toLowerCase())) {
+      showDefaultMonitoredList();
+    } else {
+      performSearch(q);
+    }
+  });
+
+  let searchSeq = 0;
+
+  inputEl.addEventListener("input", () => {
+    const q = inputEl.value.trim();
+    clearTimeout(debounceTimer);
+    searchSeq++;
+    if (!q) {
+      showDefaultMonitoredList();
+      return;
+    }
+
+    dropdownEl.innerHTML = `<div class="location-dropdown-empty">Searching...</div>`;
+    dropdownEl.style.display = "block";
+
+    debounceTimer = setTimeout(() => {
+      performSearch(q);
+    }, 280);
+  });
+
+  const performSearch = async (q: string) => {
+    const currentSeq = ++searchSeq;
+    try {
+      const res = await axios.get(`${BACKEND_URL}/geocoding/search`, {
+        params: { q },
+        timeout: 8000,
+      });
+      if (currentSeq !== searchSeq) return;
+      const results: SearchedLocation[] = res.data?.results || [];
+      renderDropdownItems(results);
+    } catch (err) {
+      if (currentSeq !== searchSeq) return;
+      console.warn("Location search error:", err);
+      dropdownEl.innerHTML = `<div class="location-dropdown-empty" style="color:var(--status-danger);">Search failed. Try again.</div>`;
+      dropdownEl.style.display = "block";
+    }
+  };
+
+  inputEl.addEventListener("keydown", (e) => {
+    if (dropdownEl.style.display === "none") {
+      if (e.key === "ArrowDown") {
+        inputEl.dispatchEvent(new Event("focus"));
+      }
+      return;
+    }
+
+    const items = dropdownEl.querySelectorAll<HTMLElement>(".location-dropdown-item");
+    if (!items.length) return;
+
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      highlightedIndex = (highlightedIndex + 1) % items.length;
+      updateHighlight(items);
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      highlightedIndex = (highlightedIndex - 1 + items.length) % items.length;
+      updateHighlight(items);
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (highlightedIndex >= 0 && highlightedIndex < currentResults.length) {
+        selectItem(currentResults[highlightedIndex]);
+      } else if (currentResults.length > 0) {
+        selectItem(currentResults[0]);
+      }
+    } else if (e.key === "Escape") {
+      dropdownEl.style.display = "none";
+    }
+  });
+
+  const updateHighlight = (items: NodeListOf<HTMLElement>) => {
+    items.forEach((it, idx) => {
+      if (idx === highlightedIndex) {
+        it.classList.add("focused");
+        it.scrollIntoView({ block: "nearest" });
+      } else {
+        it.classList.remove("focused");
+      }
+    });
+  };
+
+  // Close dropdown on click outside
+  document.addEventListener("click", (e) => {
+    const target = e.target as HTMLElement;
+    if (!target.closest("#topbar-location-control")) {
+      dropdownEl.style.display = "none";
+    }
+  });
+}
+
+// ======================================================
+// WORKFLOW PIPELINE INTERACTION
+// ======================================================
+
+function initWorkflowPipelines() {
+  // Flood Detection Pipeline Interactive Nodes
+  document.querySelector<HTMLElement>("#f-stage-s1")?.addEventListener("click", () => {
+    switchView("satellite");
+  });
+  document.querySelector<HTMLElement>("#f-stage-product")?.addEventListener("click", () => {
+    switchView("satellite");
+  });
+  document.querySelector<HTMLElement>("#f-stage-download")?.addEventListener("click", () => {
+    switchView("satellite");
+  });
+  document.querySelector<HTMLElement>("#f-stage-preprocess")?.addEventListener("click", () => {
+    if (selectedSentinel1Product) {
+      openSarProcessingModal(selectedSentinel1Product, selectedSentinel1SarStatus);
+    } else {
+      switchView("satellite");
+    }
+  });
+  document.querySelector<HTMLElement>("#f-stage-polarization")?.addEventListener("click", () => {
+    if (selectedSentinel1Product) {
+      openSarProcessingModal(selectedSentinel1Product, selectedSentinel1SarStatus);
+    }
+  });
+  document.querySelector<HTMLElement>("#f-stage-threshold")?.addEventListener("click", () => {
+    if (selectedSentinel1Product) {
+      openFloodDetectionModal(selectedSentinel1Product, "VV");
+    }
+  });
+  document.querySelector<HTMLElement>("#f-stage-mask")?.addEventListener("click", () => {
+    if (selectedSentinel1Product) {
+      openFloodDetectionModal(selectedSentinel1Product, "VV");
+    }
+  });
+  document.querySelector<HTMLElement>("#f-stage-area")?.addEventListener("click", () => {
+    document.querySelector<HTMLElement>("#flood-footprint-summary-card")?.scrollIntoView({ behavior: "smooth" });
+  });
+  document.querySelector<HTMLElement>("#f-stage-analysis")?.addEventListener("click", () => {
+    switchView("report");
+  });
+
+  // Location Observation Pipeline Interactive Nodes
+  document.querySelector<HTMLElement>("#lo-stage-search")?.addEventListener("click", () => {
+    const topInput = document.querySelector<HTMLInputElement>("#topbar-location-input");
+    topInput?.focus();
+  });
+  document.querySelector<HTMLElement>("#lo-stage-coords")?.addEventListener("click", () => {
+    switchView("satellite");
+    map.flyTo([selectedLatitude, selectedLongitude], 12, { duration: 1.2 });
+  });
+  document.querySelector<HTMLElement>("#lo-stage-map")?.addEventListener("click", () => {
+    switchView("satellite");
+    map.flyTo([selectedLatitude, selectedLongitude], 12, { duration: 1.2 });
+  });
+  document.querySelector<HTMLElement>("#lo-stage-sat")?.addEventListener("click", () => {
+    switchView("satellite");
+  });
+  document.querySelector<HTMLElement>("#lo-stage-env")?.addEventListener("click", () => {
+    switchView("dashboard");
+  });
+  document.querySelector<HTMLElement>("#lo-stage-risk")?.addEventListener("click", () => {
+    switchView("risk");
+  });
+  document.querySelector<HTMLElement>("#lo-stage-assessment")?.addEventListener("click", () => {
+    switchView("report");
+  });
+}
+
+// Database Location Select (fallback)
 dbLocationSelect?.addEventListener("change", (e) => {
   const val = (e.target as HTMLSelectElement).value;
   if (val) {
     selectMonitoredLocation(val);
-  }
-});
-
-// City Geocoding Search
-locationButton?.addEventListener("click", async () => {
-  const query = locationInput.value.trim();
-  if (!query) return;
-
-  locationButton.disabled = true;
-  locationButton.textContent = "Searching...";
-
-  try {
-    const res = await fetch(
-      `https://api.openweathermap.org/geo/1.0/direct?q=${encodeURIComponent(query)}&limit=1&appid=${API_KEY}`
-    );
-    const results = await res.json();
-    if (!results || results.length === 0) {
-      alert(`Location "${query}" not found.`);
-      return;
-    }
-
-    const { lat, lon, name, state, country } = results[0];
-    metaDistrict.textContent = name;
-    metaState.textContent = state || country;
-    metaCoords.textContent = `${lat.toFixed(4)}° N, ${lon.toFixed(4)}° E`;
-
-    map.flyTo([lat, lon], 12);
-    selectMonitoredLocation(name);
-  } catch (err) {
-    console.error("Geocoding failed", err);
-    alert("Geocoding request failed. Please check network.");
-  } finally {
-    locationButton.disabled = false;
-    locationButton.textContent = "Search City";
-  }
-});
-
-locationInput?.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") {
-    locationButton.click();
   }
 });
 
@@ -6442,8 +7412,10 @@ export function normalizeView(viewName: string): AppView {
     case "users":
     case "user-management":
       return "users";
+    case "settings":
+      return "settings" as any;
     default:
-      return activeView; // DO NOT fall back to dashboard accidentally
+      return viewName === activeView ? activeView : ("" as any);
   }
 }
 
@@ -6569,10 +7541,15 @@ export function renderCurrentView() {
       break;
   }
 
-  // Ensure scroll position resets to top on page switch
+  // Ensure scroll position resets to top on page switch and horizontal shift is cleared
+  const mainViewport = document.querySelector<HTMLElement>(".app-main-viewport");
+  if (mainViewport) {
+    mainViewport.scrollLeft = 0;
+  }
   const scrollContainer = document.querySelector<HTMLElement>("#main-content-scroll");
   if (scrollContainer) {
     scrollContainer.scrollTop = 0;
+    scrollContainer.scrollLeft = 0;
   }
 }
 
@@ -7052,6 +8029,18 @@ function updateAuthenticatedUI(user: AuthUser) {
   const isAdmin = user.role === "ADMIN";
   if (navSectionAdmin) navSectionAdmin.style.display = isAdmin ? "block" : "none";
   if (navItemUsers) navItemUsers.style.display = isAdmin ? "flex" : "none";
+
+  // Prevent Analyst from inheriting Admin-only User Management view or stale scroll offsets
+  if (!isAdmin && activeView === "users") {
+    activeView = "dashboard";
+    if (typeof window !== "undefined") {
+      (window as any).activeView = activeView;
+    }
+  }
+  const mainViewport = document.querySelector<HTMLElement>(".app-main-viewport");
+  if (mainViewport) {
+    mainViewport.scrollLeft = 0;
+  }
 }
 
 async function onLoginSuccess(user: AuthUser) {
@@ -7068,6 +8057,17 @@ async function onLoginSuccess(user: AuthUser) {
   }
 
   updateAuthenticatedUI(user);
+
+  if (user.role !== "ADMIN" && activeView === "users") {
+    activeView = "dashboard";
+    if (typeof window !== "undefined") {
+      (window as any).activeView = activeView;
+    }
+  }
+  const mainViewport = document.querySelector<HTMLElement>(".app-main-viewport");
+  if (mainViewport) {
+    mainViewport.scrollLeft = 0;
+  }
 
   // Initialize application data if not yet initialized
   if (!isEarthWatchInitialized) {
@@ -7097,6 +8097,23 @@ async function performLogout() {
     await logoutUser(BACKEND_URL);
   } catch (e) {
     console.warn("Logout error:", e);
+  }
+
+  // Reset active view to dashboard so next session starts on main dashboard layout
+  activeView = "dashboard";
+  if (typeof window !== "undefined") {
+    (window as any).activeView = activeView;
+  }
+
+  // Reset viewport scroll positions
+  const mainViewport = document.querySelector<HTMLElement>(".app-main-viewport");
+  if (mainViewport) {
+    mainViewport.scrollLeft = 0;
+  }
+  const scrollContainer = document.querySelector<HTMLElement>("#main-content-scroll");
+  if (scrollContainer) {
+    scrollContainer.scrollTop = 0;
+    scrollContainer.scrollLeft = 0;
   }
 
   if (appLayout) appLayout.style.display = "none";
@@ -7372,8 +8389,10 @@ async function bootstrapEarthWatch() {
   }
 }
 
-// Initial statistics
+// Initial statistics & interactive pipeline listeners
 updateTopStatistics();
+initLocationSearchCombobox();
+initWorkflowPipelines();
 
 // Start application via authentication bootstrap
 bootstrapEarthWatch();

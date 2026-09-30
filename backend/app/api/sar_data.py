@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Query, HTTPException
+from fastapi import APIRouter, Query, HTTPException, Depends
 
 from app.services.sar_data_service import (
     get_sentinel1_vv_asset
 )
+from app.api.deps import get_current_user
 
 
 router = APIRouter()
@@ -17,7 +18,8 @@ def get_sar_data(
     date: str = Query(
         default="2026-09-19",
         description="Requested satellite date"
-    )
+    ),
+    current_user: dict = Depends(get_current_user),
 ):
 
     try:
