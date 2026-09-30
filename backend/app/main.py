@@ -1,5 +1,19 @@
+import os
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+
+load_dotenv()
+
+# Parse comma-separated origins from CORS_ORIGINS environment variable
+_raw_cors = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
+cors_origins = [
+    origin.strip()
+    for origin in _raw_cors.split(",")
+    if origin.strip() and origin.strip() != "*"
+]
+if not cors_origins:
+    cors_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
 from app.api.satellite_db import router as satellite_db_router
 from app.api.health import router as health_router
 from app.api.satellite import router as satellite_router
@@ -40,10 +54,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173"
-    ],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
